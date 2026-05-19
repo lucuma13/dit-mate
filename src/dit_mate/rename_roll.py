@@ -113,7 +113,7 @@ def rename_in_directory(
     dry_run: bool,
     verbose: bool,
 ) -> tuple[list[str], list[str], list[str]]:
-    """Apply rename pairs inside *directory* (non-recursive, top-level only).
+    """Apply rename pairs inside *directory* (non-recursive, top-level directories only).
 
     Returns three lists: renamed, skipped, errors — each as human-readable strings.
     """
@@ -125,8 +125,8 @@ def rename_in_directory(
         src_path = directory / src_name
         dst_path = directory / dst_name
 
-        if not src_path.exists():
-            skipped.append(f"  ⏭   {src_name}  (not found in {directory})")
+        if not src_path.is_dir():
+            skipped.append(f"  ⏭   {src_name}  (directory not found in {directory})")
             continue
 
         if dst_path.exists():
