@@ -1,46 +1,65 @@
-# dit-mate (previously `basicmeta`)
+# dit-mate
 
-``basicmeta` provides a quick overview of essential technical metadata (frame rate, resolution, and encoded date) without the overhead of opening a heavy GUI or a full NLE. It is specifically optimized for DIT workflows to verify clip consistency during data offloading, ingest, or backup verification.
+`dit-mate` is a toolkit for Digital Imaging Technicians and Media Managers, fully cross-platform. It contains the following tools:
 
-It supports common professional acquisition formats:
-* Video: MXF, MOV, MP4, R3D
-* Audio: WAV
-* Other non-camera containers: MKV, AVI, M4V, MTS, FLV, WebM
+* `basicmeta` lists the essential metadata that needs to be consistent across all cameras in a given shooting day: frame rate, resolution and recorded date. It integrates [Media-Info](https://github.com/mediaarea/mediainfo) and [ExifTool](https://github.com/exiftool/exiftool) to support all professional camera acquisition formats (MXF, MOV, MP4, R3D, and BWF WAV audio), as well as some extra video containers (MKV, AVI, M4V, MTS, FLV, WebM).
 
-### 🛠️ Dependencies
+* `mkday` creates a user-defined folder structure in the volumes provided, a time-saver at the beginning of each shooting day.
 
-`basicmeta` relies on the following metadata engines:
+* `mrl` takes a directory with camera rolls and copies to the clipboard the values you need to paste in your Master Rushes Log: first and last clip name, clip count, size and duration. It requires [FFmpeg](https://github.com/ffmpeg/ffmpeg), and it handles clips split across multiple files correctly (like RED .R3D and GoPros).
 
-* [MediaInfo](https://github.com/mediaarea/mediainfo) © 2002-2025 MediaArea.net SARL (BSD 2-Clause)
-* [ExifTool](https://github.com/exiftool/exiftool) © 2003-2026 Phil Harvey (GPL-3.0)
+* `rename-roll` uses an editable dictionary (.TSV) to rename camera rolls in multiple directories. Useful in combination with ShotPut Pro when roll names need to have longer names that the volume admits
 
 ### 🚀 Installation
 
-##### macOS and Linux
+1. Install prerequisites ([Media-Info](https://mediaarea.net/en/MediaInfo/Download), [ExifTool](https://exiftool.org/install.html), [FFmpeg](https://www.ffmpeg.org/download.html)) and [uv](https://docs.astral.sh/uv/getting-started/installation/) from the official installers, or use a package manager:
 
-1. Install [Homebrew](https://brew.sh/) (if not already installed):
+* macOS: `brew install media-info exiftool ffmpeg uv`
+* Windows: `winget install MediaArea.MediaInfo OliverBetz.ExifTool Gyan.FFmpeg astral-sh.uv`
+* Linux (Debian): `apt-get install mediainfo libimage-exiftool-perl ffmpeg uv`
+<!--
+* Linux (RHEL): `yum install mediainfo perl-Image-ExifTool ffmpeg uv`
+* Linux (SUSE): `zypper install mediainfo exiftool ffmpeg python-uv`
+* Linux (Arch): `pacman -S mediainfo exiftool ffmpeg uv`
+-->
+
+2. Install the toolkit:
+
 ```
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+uv tool install dit-mate
 ```
 
-2. Tap and install:
+3. Test any of the tools (if the command is not recognised try `uv tool update-shell` and restart Terminal):
+
 ```
-brew tap lucuma13/dit
-brew install basicmeta
+basicmeta --version
 ```
 
-### 📖 Usage
+### 📖 Examples
 
-`basicmeta [options] <path>`
+Check the essential metadata of multiple camera rolls:
 
-| Option | Description |
-| :---: | :--- |
-| `-f` | Force analysis of non-camera video containers (MKV, AVI, M4V, MTS, FLV, WebM) |
-| `-h` | Show help message |
-| `--version` | Print version |
+```bash
+basicmeta "path/to/rushes/"
+basicmeta									# scans the current directory
+```
+Make the folder structure for shooting day 1, using the preset "example", on two backup drives:
+```bash
+mkday -p example_preset -d 1 "path/to/drive1" "path/to/drive2"
+```
 
-Note: `<path>` can be a single file or a directory, or the current directory if left blank.
+Copy the values you need for your Master Rushes Log:
+
+```bash
+mrl "path/to/camera/roll"					# copy default values
+mrl "path/to/camera/roll" -cs				# copy only clip count and size (in that order)
+mrl "path/to/rushes/"						# auto-detects multiple rolls
+mrl											# scans the current directory
+```
+
+Run any tool with `--help` to see the full list of options.
+
 
 ### 🧪 Feedback & Contributing
 
-If this tool fails to parse metadata from your specific camera files, or if you have ideas for improvement, please fork the repository and submit a pull request, or message me directly with a sample of the problematic metadata output. Help me make this tool more robust for the DIT community!
+If this tool fails to parse metadata from your specific camera files, or if you have ideas for improvement, please fork the repository and submit a pull request, or open an issue with a sample of the problematic metadata output. Help me make this tool more robust for the DIT community!

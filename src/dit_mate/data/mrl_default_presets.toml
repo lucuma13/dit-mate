@@ -1,0 +1,75 @@
+# mrl_default_presets.toml
+# Roll-detection configuration for mrl (Master Rushes Log helper).
+#
+# This file is copied to your user config directory on first run.
+# Edit that copy — not this one — so your changes survive package updates.
+#
+# Run  mrl -E  to open the live copy in your terminal editor ($EDITOR).
+# Run  mrl -O  to open it in the system default app for text files.
+#
+# ── known_parents ────────────────────────────────────────────────────────────
+# Directory names (case-insensitive, exact match) that mrl treats as
+# "known parent" directories — i.e. containers that hold rolls inside
+# them rather than being rolls themselves.
+#
+# Add any camera model names, department labels, or rig names your
+# productions use, e.g. "helium", "monstro", "raven", "pocket6k".
+#
+# ── known_parents_flex ───────────────────────────────────────────────────────
+# Python regular expressions matched case-insensitively against the full
+# directory name. The dot ( . ) in these patterns is intentional: it
+# matches any single separator character (space, underscore, hyphen, etc.)
+# so one pattern covers ALEXA_MINI, ALEXA-MINI, ALEXA MINI, and so on.
+#
+# ── known_parents_cam_prefix / known_parents_cam_suffix ──────────────────────
+# Regex anchored to the start / end of the directory name, also
+# case-insensitive. The built-in values match any name that starts or
+# ends with "cam", covering CAM, CAM_A, B_CAM, ACAM, etc.
+# Replace or extend these if your productions use a different convention.
+#
+# ── known_siblings_exact ─────────────────────────────────────────────────────
+# Directory names (case-insensitive, exact match) that are always excluded
+# from roll discovery regardless of what they contain.
+#
+# ── known_siblings_contains ──────────────────────────────────────────────────
+# Substrings (case-insensitive) — any directory whose name contains one of
+# these words is excluded from roll discovery.
+
+[roll_detection]
+
+known_parents = [
+    # Generic subfolders
+    "camera", "audio", "sound", "video", "other",
+    # Common cameras
+    "fx3", "fx6", "fx9", "a1", "a7s", "a7v", "venice", #sony
+    "dji", "drone", "mavic", "4d", #dji
+    "komodo", "raptor", #red
+    "alexa", #arri
+    "ursa", #blackmagic
+    "c300", "5d", #canon
+    "gopro", "gp", #gopro
+    "iphone", "ip", #UGC
+]
+
+known_parents_flex = [
+    # Dot matches any single separator: space, underscore, hyphen, etc.
+    "^alexa.mini$",
+    "^mavic.pro$",
+    "^blackmagic.pocket$",
+]
+
+known_parents_cam_prefix = "^cam"   # CAM, CAM_A, CAMERA_1 …
+known_parents_cam_suffix = "cam$"   # B_CAM, ACAM, SIDECAM …
+
+known_siblings_exact = [
+    "docs",
+    "mezz",
+    "mezzanine",
+]
+
+known_siblings_contains = [
+    "proxy",
+    "proxies",
+    "stills",
+    "report",
+]

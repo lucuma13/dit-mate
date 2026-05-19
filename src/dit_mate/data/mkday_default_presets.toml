@@ -1,0 +1,35 @@
+# mkday_presets.toml — preset definitions for mkday (part of dit-suite)
+#
+# Add as many presets as you need by editing or duplicating the example
+# provided below. Each preset is a TOML table with the following keys:
+#
+#   aliases            List of alternative names accepted by -p (case-insensitive).
+#
+#   prefix_path        Fixed directory path created between the destination root
+#                      and the day folder. Use / or \ as separator. Omit or leave
+#                      empty ("") for no prefix.
+#
+#   day_folder_format  Template for the day folder name.
+#                      Placeholders: {today} (YYYYMMDD), {day} (padded or plain
+#                      depending on day_padding).
+#
+#   day_padding        Number of digits to zero-pad the day number to.
+#                      0 = no padding  (4 → "4",  10 → "10")
+#                      2 = two digits  (4 → "04", 10 → "10")
+#
+#   subfolders         List of subdirectories created inside the day folder.
+#
+# Note: this file lives will not be removed on uninstall. To fully remove dit-suite,
+# delete this file and its parent directory manually:
+#   macOS / Linux : ~/.config/dit-mate/
+#   Windows       : %APPDATA%\dit-mate\
+
+# -----------------------------------------------------------------------
+# Example
+# -----------------------------------------------------------------------
+[example_preset]
+aliases            = ["example", "example_alias1"]
+prefix_path        = "PRODUCTION/RUSHES"
+day_folder_format  = "{today}_DAY{day}"
+day_padding        = 2
+subfolders         = ["AUDIO", "CAMERA", "DOCS", "PROXY", "STILLS"]
