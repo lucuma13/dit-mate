@@ -3,16 +3,16 @@
 # rename_roll - Batch-rename rolls (or any files/folders) from a TSV dictionary
 
 """
-`rename_roll` reads a two-column TSV file whose first column is the current name
-and second column is the new name, then renames every matching entry inside
-one or more target directories.
+`rename_roll` reads a two-column TSV file located in the user configuration 
+directory. The first column is the current name and the second column is the 
+new name, then renames every matching entry inside one or more target directories.
 
-Each row maps one source name to one destination name.  Rows starting with
-'#' are treated as comments and skipped.  Blank lines are also skipped.
+Each row maps one source name to one destination name. Rows starting with
+'#' are treated as comments and skipped. Blank lines are also skipped.
 
 Example:
 
-    rename_roll -f rename_dict.tsv /path/to/day1 /path/to/day1_backup
+    rename_roll /path/to/day1 /path/to/day1_backup
 
 The script is dry-run safe: pass --dry-run (-n) to preview what would happen
 without touching the filesystem.
@@ -24,23 +24,37 @@ import argparse
 import importlib.metadata
 import os
 import sys
-import tomllib
 from pathlib import Path
 
+from platformdirs import user_config_dir
 
 # ---------------------------------------------------------------------------
-# Version
+# Version & Paths
 # ---------------------------------------------------------------------------
 
-# Version is imported from dit-mate
 __version__ = importlib.metadata.version("dit-mate")
 
+TSV_FILENAME = "rename_dictionary.tsv"
+CONFIG_DIR = Path(user_config_dir("dit-mate"))
+TSV_PATH = CONFIG_DIR / TSV_FILENAME
+
 # ---------------------------------------------------------------------------
-# TSV parsing
+# TSV Lifecycle & Parsing
 # ---------------------------------------------------------------------------
 
-def load_rename_dict(tsv_path: Path) -> list[tuple[str, str]]:
-    """Parse a two-column TSV file into an ordered list of (source, target) pairs.
+def ensure_tsv_exists() -> None:
+    """Verify the TSV dictionary exists, or create a blank one if missing."""
+    if not TSV_PATH.exists():
+        try:
+            TSV_PATH.parent.mkdir(parents=True, exist_ok=True)
+            TSV_PATH.write_text("", encoding="utf-8")
+            print(f"✨  Created new blank dictionary file: {TSV_PATH}")
+        except OSError as exc:
+            sys.exit(f"❌  Failed to create dictionary file: {exc}")
+
+
+def load_rename_dict() -> list[tuple[str, str]]:
+    """Parse the two-column TSV file into an ordered list of (source, target) pairs.
 
     Skips blank lines and lines whose first non-whitespace character is '#'.
     Raises SystemExit on any structural error.
@@ -49,7 +63,7 @@ def load_rename_dict(tsv_path: Path) -> list[tuple[str, str]]:
     errors: list[str] = []
 
     try:
-        text = tsv_path.read_text(encoding="utf-8")
+        text = TSV_PATH.read_text(encoding="utf-8")
     except OSError as exc:
         sys.exit(f"❌  Cannot read TSV file: {exc}")
 
@@ -77,11 +91,14 @@ def load_rename_dict(tsv_path: Path) -> list[tuple[str, str]]:
 
     if errors:
         sys.exit(
-            f"❌  Errors in TSV file {tsv_path}:\n" + "\n".join(errors)
+            f"❌  Errors in TSV file {TSV_PATH}:\n" + "\n".join(errors)
         )
 
     if not pairs:
-        sys.exit(f"❌  TSV file contains no valid rename pairs: {tsv_path}")
+        sys.exit(
+            f"❌  TSV file contains no valid rename pairs: {TSV_PATH}\n"
+            f"    Run 'rename_roll -E' to add entries to the dictionary."
+        )
 
     return pairs
 
@@ -132,10 +149,10 @@ def rename_in_directory(
 
 
 # ---------------------------------------------------------------------------
-# CLI helpers  (-E / -O open the TSV, mirroring mkday's preset file pattern)
+# CLI helpers (-E / -O open the TSV, mirroring mkday's preset file pattern)
 # ---------------------------------------------------------------------------
 
-def open_tsv_with_default_app(tsv_path: Path) -> None:
+def open_tsv_with_default_app() -> None:
     """Open the TSV dictionary in the OS default app for text files.
 
     Uses:
@@ -143,20 +160,21 @@ def open_tsv_with_default_app(tsv_path: Path) -> None:
       Windows → os.startfile
       Linux   → xdg-open
     """
-    print(f"📋  Opening rename dictionary: {tsv_path}")
+    ensure_tsv_exists()
+    print(f"📋  Opening rename dictionary: {TSV_PATH}")
 
     try:
         if sys.platform == "darwin":
-            os.execvp("open", ["open", str(tsv_path)])
+            os.execvp("open", ["open", str(TSV_PATH)])
         elif sys.platform == "win32":
-            os.startfile(str(tsv_path))
+            os.startfile(str(TSV_PATH))
         else:
-            os.execvp("xdg-open", ["xdg-open", str(tsv_path)])
+            os.execvp("xdg-open", ["xdg-open", str(TSV_PATH)])
     except FileNotFoundError as exc:
         sys.exit(f"❌  Could not open TSV file: {exc}")
 
 
-def open_tsv_in_editor(tsv_path: Path) -> None:
+def open_tsv_in_editor() -> None:
     """Open the TSV dictionary in the user's preferred terminal editor.
 
     Editor resolution order:
@@ -165,15 +183,16 @@ def open_tsv_in_editor(tsv_path: Path) -> None:
       3. nano  (macOS / Linux fallback)
       4. notepad  (Windows fallback)
     """
+    ensure_tsv_exists()
     editor = (
         os.environ.get("EDITOR")
         or os.environ.get("VISUAL")
         or ("notepad" if sys.platform == "win32" else "nano")
     )
 
-    print(f"📝  Opening {tsv_path} with '{editor}'…")
+    print(f"📝  Opening {TSV_PATH} with '{editor}'…")
     try:
-        os.execvp(editor, [editor, str(tsv_path)])
+        os.execvp(editor, [editor, str(TSV_PATH)])
     except FileNotFoundError:
         sys.exit(
             f"❌  Editor not found: '{editor}'\n"
@@ -189,7 +208,7 @@ def open_tsv_in_editor(tsv_path: Path) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="rename_roll",
-        description="Batch-rename rolls from a TSV dictionary.",
+        description="Batch-rename rolls from a configuration TSV dictionary.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -201,12 +220,6 @@ def build_parser() -> argparse.ArgumentParser:
             "One or more directories to apply the renames in. "
             "If omitted, defaults to the current working directory."
         ),
-    )
-    parser.add_argument(
-        "-f", "--file",
-        metavar="TSV",
-        dest="tsv",
-        help="path to the two-column TSV rename dictionary (required for renaming)",
     )
     parser.add_argument(
         "-n", "--dry-run",
@@ -247,36 +260,21 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    # -f is required for -E and -O too: they act on the TSV file itself
-    if (args.edit_dict or args.open_dict) and not args.tsv:
-        parser.error("the following argument is required with -E/-O: -f/--file")
-
     if args.open_dict:
-        tsv_path = Path(args.tsv).resolve()
-        if not tsv_path.exists():
-            sys.exit(f"❌  TSV file not found: {tsv_path}")
-        open_tsv_with_default_app(tsv_path)
+        open_tsv_with_default_app()
         return
 
     if args.edit_dict:
-        tsv_path = Path(args.tsv).resolve()
-        if not tsv_path.exists():
-            sys.exit(f"❌  TSV file not found: {tsv_path}")
-        print(f"📋  Rename dictionary: {tsv_path}")
-        open_tsv_in_editor(tsv_path)
+        print(f"📋  Rename dictionary: {TSV_PATH}")
+        open_tsv_in_editor()
         return
 
-    # -f is required for normal operation
-    if not args.tsv:
-        parser.error("the following argument is required: -f/--file")
+    # Check and parse file for execution runs
+    ensure_tsv_exists()
+    if not TSV_PATH.is_file():
+        sys.exit(f"❌  Not a file: {TSV_PATH}")
 
-    tsv_path = Path(args.tsv).resolve()
-    if not tsv_path.exists():
-        sys.exit(f"❌  TSV file not found: {tsv_path}")
-    if not tsv_path.is_file():
-        sys.exit(f"❌  Not a file: {tsv_path}")
-
-    pairs = load_rename_dict(tsv_path)
+    pairs = load_rename_dict()
 
     # Resolve target directories
     if args.directories:
@@ -305,7 +303,7 @@ def main() -> None:
         directories = [cwd]
 
     mode_label = "[DRY RUN] " if args.dry_run else ""
-    print(f"\n🎬  rename_roll {mode_label}— {len(pairs)} pairs from {tsv_path.name}\n")
+    print(f"\n🎬  rename_roll {mode_label}— {len(pairs)} pairs from {TSV_PATH.name}\n")
 
     total_renamed = total_skipped = total_errors = 0
 
