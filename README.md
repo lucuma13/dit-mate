@@ -6,6 +6,8 @@
 
 * `mkday` creates a user-defined folder structure in the volumes provided, a time-saver at the beginning of each shooting day.
 
+* `lifsaver` addresses a macOS bug on LIFS (Live Image File System) which prevents multiple cards from mounting when they have the name "Untitled". Run it to force mount any card that is found.
+
 * `mrl` takes a directory with camera rolls and copies to the clipboard the values you need to paste in your Master Rushes Log: first and last clip name, clip count, size and duration. It requires [FFmpeg](https://github.com/ffmpeg/ffmpeg), and it handles clips split across multiple files correctly (like RED .R3D and GoPros).
 
 * `rename-roll` uses an editable dictionary (.TSV) to rename camera rolls in multiple directories. Useful in combination with ShotPut Pro when roll names need to have longer names that the volume admits
