@@ -259,8 +259,10 @@ _GOPRO_CHAPTER_RE = re.compile(r"^G([HXP])(\d{2})(\d{4})$", re.IGNORECASE)
 
 # Audio formats. WAV is the standard BWF output of most field recorders;
 # ZAX is Zaxcom's proprietary MARF container.
-AUDIO_EXTS = {".wav", ".zax"}
+# MIC is Sound Devices' proprietary container.
+AUDIO_EXTS = {".wav", ".zax", ".mic"}
 ZAX_EXT = ".zax"
+MIC_EXT = ".mic"
 
 # Cross-device contamination is detected by reducing each video clip
 # name to a "session signature" and requiring all video clips on a
@@ -1072,11 +1074,11 @@ def first_last_clips(clips: list[Clip]) -> tuple[str, str]:
       - For audio-only rolls of WAV files, sort by creation date because
         alphabetical order can lie.
       - For audio-only rolls containing **any ZAX files** (Zaxcom MARF
-        format), sort everything alphabetically. ZAX files are encrypted
-        and unreadable by ffprobe, but Zaxcom recorders
-        auto-name them sequentially so alphabetical order matches
-        recording order. When a roll mixes WAV and ZAX (rare), we
-        also fall back to alphabetical to keep the ordering rule
+        format) or **MIC files** (Sound Devices proprietary format), sort
+        everything alphabetically. These formats are unreadable by ffprobe,
+        but both recorders auto-name them sequentially so alphabetical order
+        matches recording order. When a roll mixes WAV with ZAX or MIC
+        (rare), we also fall back to alphabetical to keep the ordering rule
         consistent within the roll.
 
     Returns:
@@ -1108,11 +1110,12 @@ def first_last_clips(clips: list[Clip]) -> tuple[str, str]:
     # mix of audio formats present.
     audios = [c for c in clips if c.kind == "audio"]
     has_zax = any(
-        c.files[0].suffix.lower() == ZAX_EXT for c in audios
+        c.files[0].suffix.lower() in {ZAX_EXT, MIC_EXT} for c in audios
     )
 
     if has_zax:
-        # Alphabetical works for ZAX (sequential recorder naming) and
+        # Alphabetical works for ZAX (sequential recorder naming) and MIC
+        # (Sound Devices proprietary, also unreadable by ffprobe) and
         # is a safe fallback for any mixed-format audio roll.
         ordered_audio = sorted(audios, key=lambda c: c.name)
         return ordered_audio[0].name, ordered_audio[-1].name
