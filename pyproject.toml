@@ -54,6 +54,11 @@ dependencies = [
     "xxhash>=3.7.0",
 ]
 
+[project.optional-dependencies]
+full = [
+    "triplecheck",
+]
+
 [project.scripts]
 basicmeta = "dit_mate.basicmeta:main"
 mkday = "dit_mate.mkday:main"
