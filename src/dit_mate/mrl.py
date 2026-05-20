@@ -615,11 +615,21 @@ def find_clips(root: Path) -> tuple[list[Clip], list[Issue]]:
             ))
         return clips, issues
 
+    # Sony XDCAM sub-stream directory names that contain proxy/sub-stream
+    # MP4s (e.g. XDROOT/Sub).  These are camera-generated delivery
+    # proxies, not camera originals, and must never be counted as clips
+    # or contribute to session-signature checking.
+    _SONY_PROXY_DIRS = {"sub"}
+
     # Use os.walk so we can prune RDC subtrees: when an RDC is found in
     # `dirs`, we emit it as a Clip and remove it from `dirs` so the
     # walker doesn't descend.
     for dirpath, dirnames, filenames in os.walk(root):
         d = Path(dirpath)
+
+        # Prune Sony proxy/sub-stream directories before touching anything
+        # else so neither their files nor their subdirectories are visited.
+        dirnames[:] = [n for n in dirnames if n.lower() not in _SONY_PROXY_DIRS]
 
         # Promote any RDC subdirectory in this level to a Clip and stop
         # the walker from going inside it. Mutate dirnames in place per
