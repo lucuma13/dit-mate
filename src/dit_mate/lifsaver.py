@@ -296,7 +296,7 @@ def _find_mount_point(dev_id: str) -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Force-mount stalled "Untitled" volumes on macOS."
+        description="Force-mount stalled 'Untitled' volumes on macOS."
     )
     parser.add_argument(
         "--version",
