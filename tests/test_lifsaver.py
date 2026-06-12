@@ -14,9 +14,19 @@ import pytest
 from dit_mate import lifsaver
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Fixtures
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def mask_ci_environment(monkeypatch):
+    """Isolate tests from the GitHub Actions CI environment flag, so that they
+    can succesfully be no-op on non-macOS platforms and CI still passes a smoke
+    test."""
+    monkeypatch.delenv("CI", raising=False)
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _completed(returncode=0, stdout="", stderr=""):
     """
@@ -134,11 +144,7 @@ DISKUTIL_PLIST_MULTI = {
 
 
 # ===========================================================================
-# check_platform
-# ===========================================================================
-
-# ===========================================================================
-# _dit_mate_version / __version__
+# TestDitMateVersion
 # ===========================================================================
 
 
@@ -174,6 +180,9 @@ class TestDitMateVersion:
         out = capsys.readouterr().out
         assert out.strip() == lifsaver.__version__
 
+# ===========================================================================
+# TestCheckPlatform
+# ===========================================================================
 
 class TestCheckPlatform:
     """Unit tests for the check_platform() guard function itself."""
@@ -209,6 +218,23 @@ class TestCheckPlatform:
         err = capsys.readouterr().err
         assert "win32" in err
 
+    def test_ci_bypass_exits_zero_on_non_macos(self, monkeypatch):
+        """When CI=true, the script must exit 0 even on a restricted OS to allow smoke tests."""
+        # Simulate a non-macOS platform
+        monkeypatch.setattr(sys, "platform", "linux")
+
+        # Inject the CI environment variable
+        monkeypatch.setenv("CI", "true")
+
+        # Assert the bypass intercepts the restriction and exits cleanly
+        with pytest.raises(SystemExit) as exc_info:
+            lifsaver.check_platform()
+
+        assert exc_info.value.code == 0
+
+# ===========================================================================
+# TestMainPlatformGuard
+# ===========================================================================
 
 class TestMainPlatformGuard:
     """
@@ -277,11 +303,9 @@ class TestMainPlatformGuard:
         out = capsys.readouterr().out
         assert out == ""
 
-
 # ===========================================================================
 # get_active_mounts
 # ===========================================================================
-
 
 class TestGetActiveMounts:
     def test_parses_dev_entries(self):
@@ -308,11 +332,9 @@ class TestGetActiveMounts:
             result = lifsaver.get_active_mounts()
         assert result == set()
 
-
 # ===========================================================================
 # is_currently_mounted
 # ===========================================================================
-
 
 class TestIsCurrentlyMounted:
     def test_true_when_present(self):
@@ -335,7 +357,6 @@ class TestIsCurrentlyMounted:
 # get_disk_data
 # ===========================================================================
 
-
 class TestGetDiskData:
     def test_returns_parsed_plist(self):
         raw = plistlib.dumps(DISKUTIL_PLIST_EXTERNAL_EXFAT)
@@ -355,11 +376,9 @@ class TestGetDiskData:
         ):
             lifsaver.get_disk_data()
 
-
 # ===========================================================================
 # get_partition_fs_type
 # ===========================================================================
-
 
 class TestGetPartitionFsType:
     def test_returns_filesystem_type_lowercase(self):
@@ -386,11 +405,9 @@ class TestGetPartitionFsType:
         with patch("subprocess.run", return_value=mock_result):
             assert lifsaver.get_partition_fs_type("disk4s1") == ""
 
-
 # ===========================================================================
 # filter_target_partitions
 # ===========================================================================
-
 
 class TestFilterTargetPartitions:
     def _patch_mounts(self, mounted=None):
@@ -499,11 +516,9 @@ class TestFilterTargetPartitions:
             targets = lifsaver.filter_target_partitions(data)
         assert targets == []
 
-
 # ===========================================================================
 # _run_diskutil_mount
 # ===========================================================================
-
 
 class TestRunDiskutilMount:
     def test_returns_true_on_success(self):
@@ -594,11 +609,9 @@ class TestRunRawMount:
 
         assert "bad device" in capsys.readouterr().err
 
-
 # ===========================================================================
 # execute_mount
 # ===========================================================================
-
 
 class TestExecuteMount:
     def test_dry_run_returns_true_without_mounting(self):
@@ -661,11 +674,9 @@ class TestExecuteMount:
         assert result is False
         assert "CRITICAL ERROR" in capsys.readouterr().out
 
-
 # ===========================================================================
 # _find_mount_point
 # ===========================================================================
-
 
 class TestFindMountPoint:
     def test_extracts_correct_mount_point(self):
