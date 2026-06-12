@@ -1,5 +1,13 @@
 # dit-mate
 
+[![PyPI Version](https://img.shields.io/pypi/v/dit-mate.svg)](https://pypi.org/project/dit-mate/)
+![OS](https://img.shields.io/badge/OS-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![ty](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ty/main/assets/badge/v0.json)](https://github.com/astral-sh/ty)
+[![CI](https://github.com/lucuma13/dit-mate/actions/workflows/ci.yml/badge.svg)](https://github.com/lucuma13/dit-mate/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/lucuma13/dit-mate/graph/badge.svg?token=UAG4HDWR4J)](https://codecov.io/gh/lucuma13/dit-mate)
+
+
 `dit-mate` is a toolkit for Digital Imaging Technicians and Media Managers, fully cross-platform. It contains the following tools:
 
 * `basicmeta` lists the essential metadata that needs to be consistent across all cameras in a given shooting day: frame rate, resolution and recorded date. It integrates [Media-Info](https://github.com/mediaarea/mediainfo) and [ExifTool](https://github.com/exiftool/exiftool) to support all professional camera acquisition formats (MXF, MOV, MP4, R3D, and BWF WAV audio), as well as some extra video containers (MKV, AVI, M4V, MTS, FLV, WebM).
@@ -31,10 +39,10 @@
 uv tool install dit-mate
 ```
 
-3. Test any of the tools (if the command is not recognised try `uv tool update-shell` and restart Terminal):
+3. Test the installation (if the command is not recognised try `uv tool update-shell` and restart your terminal):
 
 ```
-basicmeta --version
+basicmeta --version; mkday --version; lifsaver --version; mrl --version; xpandroll --version
 ```
 
 ### 📖 Usage examples
