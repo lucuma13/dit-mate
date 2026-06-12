@@ -38,38 +38,46 @@
 [roll_detection]
 
 known_parents = [
-    # Generic subfolders
-    "camera", "audio", "sound", "video", "other",
-    # Common cameras
-    "fx3", "fx6", "fx9", "a1", "a7s", "a7v", "venice", #sony
-    "dji", "drone", "mavic", "4d", #dji
-    "komodo", "raptor", #red
-    "alexa", #arri
-    "ursa", #blackmagic
-    "c300", "5d", #canon
-    "gopro", "gp", #gopro
-    "iphone", "ip", #UGC
+  # Generic subfolders
+  "camera",
+  "audio",
+  "sound",
+  "video",
+  "other",
+  # Common cameras
+  "fx3",
+  "fx6",
+  "fx9",
+  "a1",
+  "a7s",
+  "a7v",
+  "venice", #sony
+  "dji",
+  "drone",
+  "mavic",
+  "4d",     #dji
+  "komodo",
+  "raptor", #red
+  "alexa",  #arri
+  "ursa",   #blackmagic
+  "c300",
+  "5d",     #canon
+  "gopro",
+  "gp",     #gopro
+  "iphone",
+  "ip",     #UGC
 ]
 
 known_parents_flex = [
-    # Dot matches any single separator: space, underscore, hyphen, etc.
-    "^alexa.mini$",
-    "^mavic.pro$",
-    "^blackmagic.pocket$",
+  # Dot matches any single separator: space, underscore, hyphen, etc.
+  "^alexa.mini$",
+  "^mavic.pro$",
+  "^blackmagic.pocket$",
 ]
 
-known_parents_cam_prefix = "^cam"   # CAM, CAM_A, CAMERA_1 …
-known_parents_cam_suffix = "cam$"   # B_CAM, ACAM, SIDECAM …
+known_parents_cam_prefix = "^cam" # CAM, CAM_A, CAMERA_1 …
+known_parents_cam_suffix = "cam$" # B_CAM, ACAM, SIDECAM …
 
-known_siblings_exact = [
-    "docs",
-    "mezz",
-    "mezzanine",
-]
+known_siblings_exact = ["docs", "mezz", "mezzanine"]
 
-known_siblings_contains = [
-    "proxy",
-    "proxies",
-    "stills",
-    "report",
-]
+known_siblings_contains = ["proxy", "proxies", "stills", "report"]
