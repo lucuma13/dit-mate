@@ -1,86 +1,97 @@
 [build-system]
-requires = ["hatchling"]
 build-backend = "hatchling.build"
+requires = [ "hatchling" ]
 
 [project]
 name = "dit-mate"
 version = "0.1.0"
 description = "A suite of utilities for Digital Imaging Technicians and post-production workflows."
 readme = "README.md"
-requires-python = ">=3.11"
+keywords = [
+  "backup-verification",
+  "bwf",
+  "camera",
+  "checksum",
+  "compare",
+  "diff",
+  "digital-imaging-technician",
+  "directory-diff",
+  "dit",
+  "exiftool",
+  "hash",
+  "media-management",
+  "mediainfo",
+  "metadata",
+  "post-production",
+  "prores",
+  "r3d",
+  "rushes-log",
+  "verification",
+  "video",
+  "wav",
+  "xavc",
+  "xxhash"
+]
 license = { text = "MIT" }
 authors = [
-    { name = "Luis Gómez Gutiérrez" },
+  { name = "Luis Gómez Gutiérrez" },
 ]
-keywords = [
-    "dit", "digital-imaging-technician",
-    "post-production",
-    "media-management",
-    "diff",
-    "compare",
-    "verification",
-    "checksum",
-    "hash",
-    "xxhash",
-    "backup-verification",
-    "directory-diff",
-    "metadata",
-    "video",
-    "camera",
-    "mediainfo",
-    "exiftool",
-    "xavc", "prores", "r3d", "wav", "bwf",
-    "rushes-log"
-]
+requires-python = ">=3.11"
 classifiers = [
-    "Development Status :: 5 - Production/Stable",
-    "Environment :: Console",
-    "Intended Audience :: End Users/Desktop",
-    "License :: OSI Approved :: MIT License",
-    "Operating System :: MacOS",
-    "Operating System :: POSIX :: Linux",
-    "Operating System :: Microsoft :: Windows",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
-    "Topic :: Multimedia :: Video",
-    "Topic :: Utilities",
+  "Development Status :: 5 - Production/Stable",
+  "Environment :: Console",
+  "Intended Audience :: End Users/Desktop",
+  "Natural Language :: English",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Multimedia :: Video",
+  "Topic :: Utilities",
 ]
-
 dependencies = [
-    "humanize>=4.15.0",
-    "platformdirs>=4.9.6",
-    "xxhash>=3.7.0",
+  "humanize>=4.15",
+  "platformdirs>=4.10",
+  "pyperclip>=1.11",
+  "xxhash>=3.7",
 ]
-
-[project.optional-dependencies]
-full = [
-    "triplecheck",
-]
-
-[project.scripts]
-basicmeta = "dit_mate.basicmeta:main"
-mkday = "dit_mate.mkday:main"
-mrl = "dit_mate.mrl:main"
-rename-roll = "dit_mate.rename_roll:main"
-lifsaver = "dit_mate.lifsaver:main"
-
-[tool.pytest.ini_options]
-pythonpath = ["src"]
-testpaths = ["tests"]
-
-[tool.hatch.build.targets.wheel]
-packages = ["src/dit_mate"]
-
-[tool.hatch.build.targets.sdist]
-include = ["src/dit_mate"]
+urls.Homepage = "https://github.com/lucuma13/dit-mate"
+scripts.basicmeta = "dit_mate.basicmeta:main"
+scripts.lifsaver = "dit_mate.lifsaver:main"
+scripts.mkday = "dit_mate.mkday:main"
+scripts.mrl = "dit_mate.mrl:main"
+scripts.xpandroll = "dit_mate.xpandroll:main"
 
 [dependency-groups]
 dev = [
-    "pytest",
-    "pytest-cov",
-    "ruff",
-    "ty",
+  "pre-commit",
+  "pytest",
+  "pytest-cov",
+  "ruff",
+  "taplo",
+  "ty",
 ]
 
+[tool.hatch]
+build.targets.wheel.packages = [ "src/dit_mate" ]
+build.targets.sdist.include = [ "src/dit_mate", "tests/" ]
+
+[tool.uv]
+managed = true
+
+[tool.ruff]
+line-length = 120
+lint.select = [ "ANN", "B", "BLE", "C", "E", "F", "FURB", "I", "PL", "PT", "PTH", "RUF", "SIM", "UP", "W" ]
+lint.ignore = [ "B", "BLE", "C", "F", "PL", "RUF", "SIM" ]  # WIP
+lint.per-file-ignores."tests/*" = [
+  "ANN",     # annotations on tests add noise without value
+  "PLR2004", # exact values in assertions are the point
+]
+
+[tool.ty]
+rules.all = "ignore"  # WIP
+
+[tool.pytest]
+ini_options.addopts = "--strict-markers --cov=src --cov-branch --cov-report=term-missing --cov-report=xml"
