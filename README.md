@@ -6,15 +6,15 @@
 
 * `mkday` creates a user-defined folder structure in the volumes provided, a time-saver at the beginning of each shooting day.
 
-* `lifsaver` addresses a macOS bug on LIFS (Live Image File System) which prevents multiple cards from mounting when they have the name "Untitled". Run it to force mount any card that is found.
+* `lifsaver` addresses a macOS bug on LIFS (Live Image File System) which prevents multiple cards from mounting when they have the name "Untitled". Run it to force mount any card that is found. Please note that whereas this utility has been fully tested, you should use it as your own risk and only if you are confident using terminal commands.
 
 * `mrl` takes a directory with camera rolls and copies to the clipboard the values you need to paste in your Master Rushes Log: first and last clip name, clip count, size and duration. It requires [FFmpeg](https://github.com/ffmpeg/ffmpeg), and it handles clips split across multiple files correctly (like RED .R3D and GoPros).
 
-* `rename-roll` uses an editable dictionary (.TSV) to rename camera rolls in multiple directories. Useful in combination with ShotPut Pro when roll names need to have longer names that the volume admits
+* `xpandroll` uses an editable dictionary (.TSV) to rename camera rolls in multiple directories. Useful in combination with ShotPut Pro when roll names need to have longer names that the volume admits
 
 ### 🚀 Installation
 
-1. Install prerequisites ([Media-Info](https://mediaarea.net/en/MediaInfo/Download), [ExifTool](https://exiftool.org/install.html), [FFmpeg](https://www.ffmpeg.org/download.html)) and [uv](https://docs.astral.sh/uv/getting-started/installation/) from the official installers, or use a package manager:
+1. Install prerequisites ([Media-Info](https://mediaarea.net/en/MediaInfo/Download), [ExifTool](https://exiftool.org/install.html), [FFmpeg](https://www.ffmpeg.org/download.html)) and [uv](https://docs.astral.sh/uv/getting-started/installation/) from the official installers, or:
 
 * macOS: `brew install media-info exiftool ffmpeg uv`
 * Windows: `winget install MediaArea.MediaInfo OliverBetz.ExifTool Gyan.FFmpeg astral-sh.uv`
@@ -37,7 +37,7 @@ uv tool install dit-mate
 basicmeta --version
 ```
 
-### 📖 Examples
+### 📖 Usage examples
 
 Check the essential metadata of multiple camera rolls:
 
@@ -59,8 +59,17 @@ mrl "path/to/rushes/"						# auto-detects multiple rolls
 mrl											# scans the current directory
 ```
 
+Force mount "Untitled" cards (on macOS only):
+
+```bash
+lifsaver
+```
+
 Run any tool with `--help` to see the full list of options.
 
+### ⚠️ Disclaimer
+
+The `lifsaver` utility  deliberately circumvents standard macOS Disk Arbitration and LIFS (Live Image File System) protections to force-mount stalled volumes. The author assumes no liability for lost or corrupted data, or hardware failures of any kind.
 
 ### 🧪 Feedback & Contributing
 
