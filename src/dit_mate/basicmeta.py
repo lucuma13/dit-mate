@@ -19,29 +19,34 @@ basicmeta                                   # scans the current directory
 """
 # Copyright (c) 2026 Luis Gómez Gutiérrez. License: MIT.
 
-from __future__ import annotations
-
 import argparse
+import ctypes
 import importlib.metadata
 import json
 import os
 import re
-import signal
 import shutil
+import signal
 import subprocess
 import sys
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
+
+# -----------------------------------------------------------------------------
+# Version
+# -----------------------------------------------------------------------------
+
+try:
+    __version__ = importlib.metadata.version("dit-mate")
+except importlib.metadata.PackageNotFoundError:  # pragma: no cover
+    __version__ = "unknown"
 
 # ---------------------------------------------------------------------------
 # Module-level constants
 # ---------------------------------------------------------------------------
 
-# Version is imported from dit-mate
-__version__ = importlib.metadata.version("dit-mate")
-
 #: Extensions that are *always* parsed (genuine camera containers).
-CAMERA_VIDEO_EXTS = {"mxf", "mp4", "mov"}
+CAMERA_VIDEO_EXTS = {"mxf", "mp4", "mov", "insv"}
 
 #: Extensions that are only parsed when the user passes ``-f``.
 #: These are common but generic, and seeing them next to camera originals
@@ -56,6 +61,7 @@ MEDIAINFO_EXTS = CAMERA_VIDEO_EXTS | OTHER_VIDEO_EXTS
 # ---------------------------------------------------------------------------
 # Terminal color setup
 # ---------------------------------------------------------------------------
+
 
 def _enable_ansi_on_windows() -> bool:
     """Enable ANSI escape processing on Windows 10+ consoles.
@@ -76,7 +82,6 @@ def _enable_ansi_on_windows() -> bool:
     try:
         # ctypes is in the stdlib; we use it to call the Win32 console API
         # directly so we don't pull in colorama as a third-party dep.
-        import ctypes
         kernel32 = ctypes.windll.kernel32
         # GetStdHandle(-11) == STD_OUTPUT_HANDLE
         h = kernel32.GetStdHandle(-11)
@@ -112,7 +117,19 @@ RESET = "\033[0m" if _ANSI_OK else ""
 
 #: Broadcast-standard frame rates. fps strings not in this set are
 #: coloured orange as a heads-up that the rate is unusual.
-KNOWN_FPS = {"23.976", "23.97", "24", "25", "29.970", "29.97", "30", "50", "59.940", "59.94", "60"}
+KNOWN_FPS = {
+    "23.976",
+    "23.97",
+    "24",
+    "25",
+    "29.970",
+    "29.97",
+    "30",
+    "50",
+    "59.940",
+    "59.94",
+    "60",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -152,12 +169,15 @@ def _distribute_hyphens(total: int, n_gaps: int) -> list[int]:
 
 
 def _res_is_low(res_raw: str) -> bool:
-    """Return True if resolution is below 1920x1080 (excludes Audio/empty)."""
+    """Return True if resolution is below Full HD (excludes Audio/empty)."""
+    FULL_HD_WIDTH = 1920
+    FULL_HD_HEIGHT = 1080
+
     if not res_raw or res_raw == "Audio":
         return False
     try:
         w, h = (int(x.strip()) for x in res_raw.split("x", 1))
-        return w < 1920 or h < 1080
+        return w < FULL_HD_WIDTH or h < FULL_HD_HEIGHT
     except (ValueError, TypeError):
         return False
 
@@ -192,6 +212,7 @@ if os.name == "nt":
 # Subprocess helpers
 # ---------------------------------------------------------------------------
 
+
 def _run(cmd: list[str]) -> str:
     """Run a command and return its stdout as a string.
 
@@ -212,9 +233,9 @@ def _run(cmd: list[str]) -> str:
         r = subprocess.run(
             cmd,
             capture_output=True,
-            text=True,         # decode stdout/stderr as utf-8
-            check=False,       # don't raise on non-zero exit
-            **_POPEN_KW,       # CREATE_NO_WINDOW on Windows
+            text=True,  # decode stdout/stderr as utf-8
+            check=False,  # don't raise on non-zero exit
+            **_POPEN_KW,  # CREATE_NO_WINDOW on Windows
         )
         return r.stdout
     except FileNotFoundError:
@@ -229,6 +250,7 @@ def _run(cmd: list[str]) -> str:
 # ---------------------------------------------------------------------------
 # Field normalization
 # ---------------------------------------------------------------------------
+
 
 def _norm_fps(s: str) -> str:
     """Normalize a frame-rate value to the display form used by basicmeta.
@@ -253,11 +275,11 @@ def _norm_fps(s: str) -> str:
         # then strip ".000" so integer rates display compactly.
         f = float(s)
         out = f"{f:.3f}"
-        return out[:-4] if out.endswith(".000") else out
+        return out.removesuffix(".000")
     except ValueError:
         # Non-numeric values (rare — usually a sentinel like "VFR")
         # pass through, with the same .000 trimming applied textually.
-        return s[:-4] if s.endswith(".000") else s
+        return s.removesuffix(".000")
 
 
 def _norm_date_iso(s: str) -> str:
@@ -292,6 +314,7 @@ def _norm_date_iso(s: str) -> str:
 # ---------------------------------------------------------------------------
 # MediaInfo: ONE call for all video files; parse JSON array
 # ---------------------------------------------------------------------------
+
 
 def batch_mediainfo(paths: list[Path]) -> dict[Path, str]:
     """Run mediainfo once for every video file and format one line each.
@@ -371,9 +394,6 @@ def batch_mediainfo(paths: list[Path]) -> dict[Path, str]:
 
         fps_raw = _norm_fps(gen.get("FrameRate", ""))
         fps_mode = gen.get("FrameRate_Mode", "")
-        vfr_tag = f" {ORANGE}[VFR]{RESET}" if fps_mode == "VFR" else ""
-        fps_colour = ORANGE if fps_raw and fps_raw not in KNOWN_FPS else ""
-        fps = f"{fps_colour}{fps_raw}{RESET if fps_colour else ""}{vfr_tag}"
         # Use ONLY Encoded_Date — never File_Modified_Date, which is just
         # the filesystem mtime and has nothing to do with the recording.
         date = _norm_date_iso(gen.get("Encoded_Date", ""))
@@ -391,8 +411,14 @@ def batch_mediainfo(paths: list[Path]) -> dict[Path, str]:
         # just the extension — confusing but matches the original tool.
         ext_name = gen.get("FileNameExtension") or p.name
 
-        coloured_res = f"{res_colour}{res}{RESET if res_colour else ""}"
-        results[p] = (fps_raw, coloured_res if res_colour else res, date, "", ext_name or p.name)
+        coloured_res = f"{res_colour}{res}{RESET if res_colour else ''}"
+        results[p] = (
+            fps_raw,
+            coloured_res if res_colour else res,
+            date,
+            "",
+            ext_name or p.name,
+        )
 
     return results
 
@@ -452,11 +478,11 @@ def _render_line(
             coloured.append((val, _vis(val), "resolution"))
 
         elif field == "date":
-            val = date_raw if date_raw else f"{RED}Unknown{RESET}"
+            val = date_raw or f"{RED}Unknown{RESET}"
             coloured.append((val, _vis(val), "date"))
 
         elif field == "sn":
-            val = sn if sn else f"{RED}Unknown{RESET}"
+            val = sn or f"{RED}Unknown{RESET}"
             coloured.append((val, _vis(val), "sn"))
 
     if not coloured:
@@ -511,6 +537,7 @@ def _render_line(
 # Exiftool batched output parsing
 # ---------------------------------------------------------------------------
 
+
 def _split_exiftool_batches(out: str, n_files: int) -> list[dict[str, str]]:
     """Parse exiftool's multi-file output into one record per file.
 
@@ -552,7 +579,7 @@ def _split_exiftool_batches(out: str, n_files: int) -> list[dict[str, str]]:
             # Stash the file path under a private key so we can match
             # records to input paths later. exiftool sometimes adds a
             # trailing colon to the path on this line — strip generously.
-            cur = {"_file": line[len("======== "):].rstrip(":").strip()}
+            cur = {"_file": line[len("======== ") :].rstrip(":").strip()}
         elif ":" in line:
             # exiftool with -s2 emits "Tag: value" lines (no padding).
             # ``partition`` cleanly splits on the *first* colon only,
@@ -609,12 +636,20 @@ def batch_r3d(paths: list[Path]) -> dict[Path, str]:
     if not paths:
         return {}
 
-    out = _run([
-        "exiftool", "-s2", "-m",
-        "-FrameRate", "-DateTimeOriginal", "-ImageWidth", "-ImageHeight",
-        "-SerialNumber", "-Filename",
-        *map(str, paths),
-    ])
+    out = _run(
+        [
+            "exiftool",
+            "-s2",
+            "-m",
+            "-FrameRate",
+            "-DateTimeOriginal",
+            "-ImageWidth",
+            "-ImageHeight",
+            "-SerialNumber",
+            "-Filename",
+            *map(str, paths),
+        ]
+    )
     recs = _split_exiftool_batches(out, len(paths))
 
     # Build a path -> record lookup. With >=2 files, exiftool's "========"
@@ -644,7 +679,7 @@ def batch_r3d(paths: list[Path]) -> dict[Path, str]:
         # "Filename" (lowercase). Accept either.
         name = rec.get("FileName") or rec.get("Filename") or p.name
 
-        sn  = rec.get("SerialNumber", "")
+        sn = rec.get("SerialNumber", "")
         res = f"{w} x {h}" if (w and h) else ""
         results[p] = (fps, res, date, sn, name)
     return results
@@ -669,29 +704,40 @@ def batch_wav(paths: list[Path]) -> dict[Path, str]:
     if not paths:
         return {}
 
-    out = _run([
-        "exiftool",
-        "-s", "-s",
-        # Frame-rate aliases, in order of preference. The first non-empty
-        # value wins. iXML's BWF tags are the most authoritative for
-        # location-sound recordings.
-        "-BwfxmlSpeedTimecodeRate", "-iXML:SampleRate",
-        "-Speed", "-VideoFrameRate",
-        # Date aliases. We probe all of them and take the first that
-        # contains real (non-zero) digits, since some recorders write
-        # placeholder dates when no system clock is set.
-        "-DateTimeOriginal", "-DateCreated", "-BwfxmlBextBwfOriginationDate",
-        "-Filename",
-        *map(str, paths),
-    ])
+    out = _run(
+        [
+            "exiftool",
+            "-s",
+            "-s",
+            # Frame-rate aliases, in order of preference. The first non-empty
+            # value wins. iXML's BWF tags are the most authoritative for
+            # location-sound recordings.
+            "-BwfxmlSpeedTimecodeRate",
+            "-iXML:SampleRate",
+            "-Speed",
+            "-VideoFrameRate",
+            # Date aliases. We probe all of them and take the first that
+            # contains real (non-zero) digits, since some recorders write
+            # placeholder dates when no system clock is set.
+            "-DateTimeOriginal",
+            "-DateCreated",
+            "-BwfxmlBextBwfOriginationDate",
+            "-Filename",
+            *map(str, paths),
+        ]
+    )
     recs = _split_exiftool_batches(out, len(paths))
 
     # Probe order matters: try the most-specific tags first so a recorder
     # that writes both BWF timecode rate and a generic VideoFrameRate ends
     # up with the BWF value (which is the intended audio reference).
     fps_keys = ("BwfxmlSpeedTimecodeRate", "VideoFrameRate", "Speed", "iXML")
-    date_keys = ("DateTimeOriginal", "DateCreated", "OriginatorReference",
-                 "BwfxmlBextBwfOriginationDate")
+    date_keys = (
+        "DateTimeOriginal",
+        "DateCreated",
+        "OriginatorReference",
+        "BwfxmlBextBwfOriginationDate",
+    )
 
     by_file: dict[str, dict[str, str]] = {}
     for rec in recs:
@@ -737,6 +783,7 @@ def batch_wav(paths: list[Path]) -> dict[Path, str]:
 # Driver: directory walk, dispatch, and output assembly
 # ---------------------------------------------------------------------------
 
+
 def batch_sn(paths: list[Path]) -> dict[Path, str]:
     """Fetch camera serial numbers via exiftool.
 
@@ -759,11 +806,17 @@ def batch_sn(paths: list[Path]) -> dict[Path, str]:
     if not paths:
         return {}
 
-    out = _run([
-        "exiftool", "-json", "-m",
-        "-CameraSerialNumber", "-SerialNumber", "-BwfxmlUserTserial",
-        *map(str, paths),
-    ])
+    out = _run(
+        [
+            "exiftool",
+            "-json",
+            "-m",
+            "-CameraSerialNumber",
+            "-SerialNumber",
+            "-BwfxmlUserTserial",
+            *map(str, paths),
+        ]
+    )
 
     result: dict[Path, str] = {}
     if out.strip():
@@ -773,28 +826,21 @@ def batch_sn(paths: list[Path]) -> dict[Path, str]:
             entries = []
         # exiftool always includes "SourceFile" in -json output — use it
         # to key records back to our input paths.
-        by_path: dict[str, dict] = {
-            os.path.normpath(e["SourceFile"]): e
-            for e in entries
-            if "SourceFile" in e
-        }
+        by_path: dict[str, dict] = {os.path.normpath(e["SourceFile"]): e for e in entries if "SourceFile" in e}
         for p in paths:
             rec = by_path.get(os.path.normpath(str(p)), {})
-            sn = (
-                rec.get("CameraSerialNumber")
-                or rec.get("SerialNumber")
-                or rec.get("BwfxmlUserTserial")
-                or ""
-            )
+            sn = rec.get("CameraSerialNumber") or rec.get("SerialNumber") or rec.get("BwfxmlUserTserial") or ""
             result[p] = sn
 
     for p in paths:
         result.setdefault(p, "")
     return result
 
+
 # ---------------------------------------------------------------------------
 # Driver: directory walk, dispatch, and output assembly
 # ---------------------------------------------------------------------------
+
 
 def collect_files_by_subdir(
     target: Path,
@@ -825,7 +871,7 @@ def collect_files_by_subdir(
 
     result: list[tuple[Path, list[Path], list[Path], list[Path]]] = []
     for subdir in subdirs:
-        mi:  list[Path] = []
+        mi: list[Path] = []
         r3d: list[Path] = []
         wav: list[Path] = []
         for f in sorted(subdir.iterdir()):
@@ -873,7 +919,7 @@ def _batch_groups(
         for dispatch. The three lists within each batch are homogeneous —
         no cross-type mixing.
     """
-    buf_mi:  list[Path] = []
+    buf_mi: list[Path] = []
     buf_r3d: list[Path] = []
     buf_wav: list[Path] = []
     batches: list[tuple[list[Path], list[Path], list[Path]]] = []
@@ -881,7 +927,9 @@ def _batch_groups(
     def _flush() -> None:
         if buf_mi or buf_r3d or buf_wav:
             batches.append((buf_mi[:], buf_r3d[:], buf_wav[:]))
-            buf_mi.clear(); buf_r3d.clear(); buf_wav.clear()
+            buf_mi.clear()
+            buf_r3d.clear()
+            buf_wav.clear()
 
     for _subdir, mi, r3d, wav in groups:
         buf_mi.extend(mi)
@@ -900,17 +948,18 @@ def _batch_groups(
 # Verify system dependencies
 # ---------------------------------------------------------------------------
 
+
 def _check_dependencies() -> None:
     """Verify required system binaries are available on PATH."""
     deps = ["mediainfo", "exiftool"]
     missing = [d for d in deps if shutil.which(d) is None]
-    
+
     if not missing:
         return
 
     # Direct errors to stderr to avoid polluting piped output.
     print(f"Error: Missing system dependencies: {', '.join(missing)}", file=sys.stderr)
-    
+
     if sys.platform == "darwin":
         # Use media-info for Brew CLI installation.
         brew_args = " ".join(["media-info" if d == "mediainfo" else d for d in missing])
@@ -920,15 +969,15 @@ def _check_dependencies() -> None:
     elif sys.platform.startswith("linux"):
         # Identify package manager and family-specific package names.
         mgr, p_exif = None, "exiftool"
-        
+
         if shutil.which("apt-get"):
-            mgr, p_exif = "apt-get install", "libimage-exiftool-perl" # Debian-based
+            mgr, p_exif = "apt-get install", "libimage-exiftool-perl"  # Debian-based
         elif shutil.which("yum"):
-            mgr, p_exif = "yum install", "perl-Image-ExifTool"      # RHEL-based
+            mgr, p_exif = "yum install", "perl-Image-ExifTool"  # RHEL-based
         elif shutil.which("zypper"):
-            mgr, p_exif = "zypper install", "exiftool"             # SUSE-based
+            mgr, p_exif = "zypper install", "exiftool"  # SUSE-based
         elif shutil.which("pacman"):
-            mgr, p_exif = "pacman -S", "exiftool"                  # Arch-based
+            mgr, p_exif = "pacman -S", "exiftool"  # Arch-based
 
         if mgr:
             linux_args = " ".join([p_exif if d == "exiftool" else d for d in missing])
@@ -937,7 +986,10 @@ def _check_dependencies() -> None:
         else:
             # Fallback for Linux distributions without supported managers.
             if "mediainfo" in missing:
-                print("  Download MediaInfo: https://mediaarea.net/en/MediaInfo", file=sys.stderr)
+                print(
+                    "  Download MediaInfo: https://mediaarea.net/en/MediaInfo",
+                    file=sys.stderr,
+                )
             if "exiftool" in missing:
                 print("  Download ExifTool: https://exiftool.org/", file=sys.stderr)
 
@@ -949,14 +1001,20 @@ def _check_dependencies() -> None:
     else:
         # Final fallback for entirely unsupported platforms.
         if "mediainfo" in missing:
-            print("  Download MediaInfo: https://mediaarea.net/en/MediaInfo", file=sys.stderr)
+            print(
+                "  Download MediaInfo: https://mediaarea.net/en/MediaInfo",
+                file=sys.stderr,
+            )
         if "exiftool" in missing:
             print("  Download ExifTool: https://exiftool.org/", file=sys.stderr)
-            
+
     sys.exit(1)
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
 
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point.
@@ -981,27 +1039,41 @@ def main(argv: list[str] | None = None) -> int:
         prog="basicmeta",
         description="Basic metadata utility for sanity checking original camera files",
     )
-    p.add_argument("path", nargs="?", default=".",
-                   help="file or directory to analyze (default: current dir)")
+    p.add_argument(
+        "path",
+        nargs="?",
+        default=".",
+        help="file or directory to analyze (default: current dir)",
+    )
 
-    p.add_argument("-f", "--force", action="store_true",
-                   help="force analysis of non-camera video containers"
-                        " (MKV, AVI, M4V, MTS, FLV, WebM)")
-    p.add_argument("--fps", action="store_true",
-                   help="print frame rate")
-    p.add_argument("--resolution", action="store_true",
-                   help="print resolution")
-    p.add_argument("--date", action="store_true",
-                   help="print encoded date")
-    p.add_argument("--sn", "--serialnumber", dest="sn", action="store_true",
-                   help="print camera serial number (extra exiftool call for non-R3D files)")
+    p.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="force analysis of non-camera video containers (MKV, AVI, M4V, MTS, FLV, WebM)",
+    )
+    p.add_argument("--fps", action="store_true", help="print frame rate")
+    p.add_argument("--resolution", action="store_true", help="print resolution")
+    p.add_argument("--date", action="store_true", help="print encoded date")
+    p.add_argument(
+        "--sn",
+        "--serialnumber",
+        dest="sn",
+        action="store_true",
+        help="print camera serial number (extra exiftool call for non-R3D files)",
+    )
     p.add_argument("--version", action="version", version=__version__)
     args = p.parse_args(argv)
 
     # Build an ordered field list from argv token order.
     # No field flags → all fields in default order.
-    _flag_to_field = {"--fps": "fps", "--resolution": "resolution",
-                      "--date": "date", "--sn": "sn", "--serialnumber": "sn"}
+    _flag_to_field = {
+        "--fps": "fps",
+        "--resolution": "resolution",
+        "--date": "date",
+        "--sn": "sn",
+        "--serialnumber": "sn",
+    }
     # "sn" is absent from _default_fields intentionally — it triggers an
     # extra exiftool call and must only run when explicitly requested.
     _default_fields = ["fps", "resolution", "date"]
@@ -1058,8 +1130,12 @@ def main(argv: list[str] | None = None) -> int:
     # label columns align exactly with data columns. We use plain label
     # strings (no ANSI colour inside the value) and space-padding instead
     # of hyphens between columns.
-    _field_labels = {"fps": "FPS", "resolution": "RESOLUTION",
-                     "date": "DATE", "sn": "S/N"}
+    _field_labels = {
+        "fps": "FPS",
+        "resolution": "RESOLUTION",
+        "date": "DATE",
+        "sn": "S/N",
+    }
 
     # Map each label to the visible width its data column uses, mirroring
     # _render_line: fps appends " fps" so its slot = len("FPS") padded to
@@ -1087,21 +1163,13 @@ def main(argv: list[str] | None = None) -> int:
         #   date field -> "DATE"
         #   sn field   -> "S/N"
         # We need to fake audio=False (video header) so res shows normally.
-        hdr_fps  = "FPS"        if "fps"        in fields else ""
-        hdr_res  = "RESOLUTION" if "resolution" in fields else ""
-        hdr_date = "DATE"       if "date"       in fields else ""
-        hdr_sn   = "S/N"        if "sn"         in fields else ""
         # _render_line appends " fps" to the fps value; strip that from label
         # by temporarily monkey-patching... actually just build directly:
         # The header is a plain string at the same column positions as data.
         # We build it like _render_line but with plain labels and spaces.
         hdr_parts: list[tuple[str, int, str]] = []
         for f, label in active_labels:
-            if f == "fps":
-                display = label
-            elif f == "resolution":
-                display = label
-            elif f == "date":
+            if f in {"fps", "resolution", "date"}:
                 display = label
             else:
                 display = label
@@ -1145,12 +1213,12 @@ def main(argv: list[str] | None = None) -> int:
         print(hdr_line)
 
     for mi, r3d, wav in batches:
-        mi_out  = batch_mediainfo(mi)
+        mi_out = batch_mediainfo(mi)
         r3d_out = batch_r3d(r3d)
         wav_out = batch_wav(wav)
         # batch_sn is only called when --sn was requested; for R3D the
         # serial number is already inside the batch_r3d tuple.
-        sn_mi  = batch_sn(mi)  if "sn" in fields else {}
+        sn_mi = batch_sn(mi) if "sn" in fields else {}
         sn_wav = batch_sn(wav) if "sn" in fields else {}
 
         lines: list[str] = []
@@ -1174,24 +1242,27 @@ def main(argv: list[str] | None = None) -> int:
         emit(lines)
 
     # ---- Summary -------------------------------------------------------------
-    fps_vals  = {r[0] for r in all_raw if r[0]}                     if "fps"        in fields else set()
-    res_vals  = {r[1] for r in all_raw if r[1] and r[1] != "Audio"} if "resolution" in fields else set()
-    date_vals = {r[2] for r in all_raw if r[2]}                     if "date"       in fields else set()
-    sn_vals   = {r[3] for r in all_raw if r[3]}                     if "sn"         in fields else set()
+    fps_vals = {r[0] for r in all_raw if r[0]} if "fps" in fields else set()
+    res_vals = {r[1] for r in all_raw if r[1] and r[1] != "Audio"} if "resolution" in fields else set()
+    date_vals = {r[2] for r in all_raw if r[2]} if "date" in fields else set()
+    sn_vals = {r[3] for r in all_raw if r[3]} if "sn" in fields else set()
 
     if all_raw and len(set(all_raw)) == 1:
         print("\n🎯 All the files scanned have the same frame rate, resolution and encoded date")
     elif all_raw:
         mismatched: list[str] = []
-        if len(fps_vals)  > 1: mismatched.append("frame rate")
-        if len(res_vals)  > 1: mismatched.append("resolution")
-        if len(date_vals) > 1: mismatched.append("encoded date")
-        if len(sn_vals)   > 1: mismatched.append("serial number")
+        if len(fps_vals) > 1:
+            mismatched.append("frame rate")
+        if len(res_vals) > 1:
+            mismatched.append("resolution")
+        if len(date_vals) > 1:
+            mismatched.append("encoded date")
+        if len(sn_vals) > 1:
+            mismatched.append("serial number")
 
         if mismatched:
             summary_fields = (
-                mismatched[0] if len(mismatched) == 1
-                else ", ".join(mismatched[:-1]) + f" and {mismatched[-1]}"
+                mismatched[0] if len(mismatched) == 1 else ", ".join(mismatched[:-1]) + f" and {mismatched[-1]}"
             )
             print(f"\n\U0001f440 Manual check required, some files have a different {summary_fields}")
     return 0

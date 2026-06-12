@@ -3,8 +3,8 @@
 # xpandroll - Batch-rename rolls (or any files/folders) from a TSV dictionary
 
 """
-`xpandroll` reads a two-column TSV file located in the user configuration 
-directory. The first column is the current name and the second column is the 
+`xpandroll` reads a two-column TSV file located in the user configuration
+directory. The first column is the current name and the second column is the
 new name, then renames every matching entry inside one or more target directories.
 
 Each row maps one source name to one destination name. Rows starting with
@@ -28,11 +28,18 @@ from pathlib import Path
 
 from platformdirs import user_config_dir
 
+# -----------------------------------------------------------------------------
+# Version
+# -----------------------------------------------------------------------------
+
+try:
+    __version__ = importlib.metadata.version("dit-mate")
+except importlib.metadata.PackageNotFoundError:  # pragma: no cover
+    __version__ = "unknown"
+
 # ---------------------------------------------------------------------------
 # Version & Paths
 # ---------------------------------------------------------------------------
-
-__version__ = importlib.metadata.version("dit-mate")
 
 TSV_FILENAME = "rename_dictionary.tsv"
 CONFIG_DIR = Path(user_config_dir("dit-mate"))
@@ -41,6 +48,7 @@ TSV_PATH = CONFIG_DIR / TSV_FILENAME
 # ---------------------------------------------------------------------------
 # TSV Lifecycle & Parsing
 # ---------------------------------------------------------------------------
+
 
 def ensure_tsv_exists() -> None:
     """Verify the TSV dictionary exists, or create a blank one if missing."""
@@ -73,26 +81,19 @@ def load_rename_dict() -> list[tuple[str, str]]:
             continue
         cols = line.split("\t")
         if len(cols) < 2:
-            errors.append(
-                f"  Line {lineno}: expected 2 tab-separated columns, "
-                f"got {len(cols)}: {raw!r}"
-            )
+            errors.append(f"  Line {lineno}: expected 2 tab-separated columns, got {len(cols)}: {raw!r}")
             continue
         src, dst = cols[0].strip(), cols[1].strip()
         if not src:
             errors.append(f"  Line {lineno}: source name is empty")
             continue
         if not dst:
-            errors.append(
-                f"  Line {lineno}: destination name is empty for source '{src}'"
-            )
+            errors.append(f"  Line {lineno}: destination name is empty for source '{src}'")
             continue
         pairs.append((src, dst))
 
     if errors:
-        sys.exit(
-            f"❌  Errors in TSV file {TSV_PATH}:\n" + "\n".join(errors)
-        )
+        sys.exit(f"❌  Errors in TSV file {TSV_PATH}:\n" + "\n".join(errors))
 
     if not pairs:
         sys.exit(
@@ -107,6 +108,7 @@ def load_rename_dict() -> list[tuple[str, str]]:
 # Rename logic
 # ---------------------------------------------------------------------------
 
+
 def rename_in_directory(
     directory: Path,
     pairs: list[tuple[str, str]],
@@ -119,7 +121,7 @@ def rename_in_directory(
     """
     renamed: list[str] = []
     skipped: list[str] = []
-    errors:  list[str] = []
+    errors: list[str] = []
 
     for src_name, dst_name in pairs:
         src_path = directory / src_name
@@ -130,10 +132,7 @@ def rename_in_directory(
             continue
 
         if dst_path.exists():
-            errors.append(
-                f"  ❌  {src_name} → {dst_name}  "
-                f"(destination already exists in {directory})"
-            )
+            errors.append(f"  ❌  {src_name} → {dst_name}  (destination already exists in {directory})")
             continue
 
         if dry_run:
@@ -151,6 +150,7 @@ def rename_in_directory(
 # ---------------------------------------------------------------------------
 # CLI helpers (-E / -O open the TSV, mirroring mkday's preset file pattern)
 # ---------------------------------------------------------------------------
+
 
 def open_tsv_with_default_app() -> None:
     """Open the TSV dictionary in the OS default app for text files.
@@ -184,11 +184,7 @@ def open_tsv_in_editor() -> None:
       4. notepad  (Windows fallback)
     """
     ensure_tsv_exists()
-    editor = (
-        os.environ.get("EDITOR")
-        or os.environ.get("VISUAL")
-        or ("notepad" if sys.platform == "win32" else "nano")
-    )
+    editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or ("notepad" if sys.platform == "win32" else "nano")
 
     print(f"📝  Opening {TSV_PATH} with '{editor}'…")
     try:
@@ -205,6 +201,7 @@ def open_tsv_in_editor() -> None:
 # Argument parser
 # ---------------------------------------------------------------------------
 
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="xpandroll",
@@ -217,29 +214,32 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="*",
         metavar="PATH",
         help=(
-            "One or more directories to apply the renames in. "
-            "If omitted, defaults to the current working directory."
+            "One or more directories to apply the renames in. If omitted, defaults to the current working directory."
         ),
     )
     parser.add_argument(
-        "-n", "--dry-run",
+        "-n",
+        "--dry-run",
         action="store_true",
         dest="dry_run",
         help="preview what would be renamed without touching the filesystem",
     )
     parser.add_argument(
-        "-v", "--verbose",
+        "-v",
+        "--verbose",
         action="store_true",
         help="also print skipped entries (not found in directory)",
     )
     parser.add_argument(
-        "-E", "--edit-dict",
+        "-E",
+        "--edit-dict",
         action="store_true",
         dest="edit_dict",
         help="edit the TSV dictionary in your default terminal editor ($EDITOR)",
     )
     parser.add_argument(
-        "-O", "--open-dict",
+        "-O",
+        "--open-dict",
         action="store_true",
         dest="open_dict",
         help="open the TSV dictionary in the system default app for text files",
@@ -255,6 +255,7 @@ def build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
 
 def main() -> None:
     parser = build_parser()
@@ -292,10 +293,7 @@ def main() -> None:
         try:
             cwd = Path.cwd().resolve()
         except FileNotFoundError:
-            sys.exit(
-                "❌  Current directory does not exist. "
-                "Please change to a valid directory."
-            )
+            sys.exit("❌  Current directory does not exist. Please change to a valid directory.")
         if not cwd.is_dir():
             sys.exit(f"❌  Current directory does not exist: {cwd}")
         if not args.dry_run and not os.access(cwd, os.W_OK):
@@ -309,9 +307,7 @@ def main() -> None:
 
     for directory in directories:
         print(f"📂  {directory}")
-        renamed, skipped, errors = rename_in_directory(
-            directory, pairs, dry_run=args.dry_run, verbose=args.verbose
-        )
+        renamed, skipped, errors = rename_in_directory(directory, pairs, dry_run=args.dry_run, verbose=args.verbose)
 
         for line in renamed:
             print(line)
@@ -323,7 +319,7 @@ def main() -> None:
 
         total_renamed += len(renamed)
         total_skipped += len(skipped)
-        total_errors  += len(errors)
+        total_errors += len(errors)
 
     # Summary
     verb = "Would rename" if args.dry_run else "Renamed"

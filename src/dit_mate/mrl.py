@@ -12,6 +12,7 @@ Handles the directory layouts that common camera copy tools produce:
 - RED R3D:           ``<ROLL>/<RDM>/<CLIPNAME>.RDC/<CLIPNAME>_NNN.R3D``
 - RED ProRes/H.265:  ``<ROLL>/<RDM>/<CLIPNAME>.RDC/<CLIPNAME>.mov`` (Komodo/DSMC3)
 - GoPro:             ``<ROLL>/<CLIPNAME>.MP4`` + ``.LRV`` proxy + ``.WAV``
+- Insta360:          ``<ROLL>/DCIM/Camera01/<CLIPNAME>.insv``
 - Sound mixer WAVs:  ``<ROLL>/<CLIPNAME>.wav``
 
 Multi-roll detection
@@ -34,9 +35,11 @@ Combined short flags work POSIX-style: ``-flsdc`` is equivalent to
 ``-f -l -s -d -c``. Column order in the output follows the order flags
 are given on the command line.
 """
+
 from __future__ import annotations
 
 import argparse
+import ctypes
 import importlib.metadata
 import json
 import os
@@ -46,22 +49,30 @@ import subprocess
 import sys
 import tomllib
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
+import pyperclip
 from platformdirs import user_config_dir
+
+# -----------------------------------------------------------------------------
+# Version
+# -----------------------------------------------------------------------------
+
+try:
+    __version__ = importlib.metadata.version("dit-mate")
+except importlib.metadata.PackageNotFoundError:  # pragma: no cover
+    __version__ = "unknown"
 
 # ---------------------------------------------------------------------------
 # Roll-detection config  (loaded from mrl_presets.toml in user config dir)
 # ---------------------------------------------------------------------------
 
-# Version is imported from dit-mate
-__version__ = importlib.metadata.version("dit-mate")
-
-PRESETS_FILENAME   = "mrl_presets.toml"
-DEFAULT_PRESETS    = "mrl_default_presets.toml"
-CONFIG_DIR         = Path(user_config_dir("dit-mate"))
-PRESETS_PATH       = CONFIG_DIR / PRESETS_FILENAME
-BUNDLED_PRESETS    = Path(__file__).parent / "data" / DEFAULT_PRESETS
+PRESETS_FILENAME = "mrl_presets.toml"
+DEFAULT_PRESETS = "mrl_default_presets.toml"
+CONFIG_DIR = Path(user_config_dir("dit-mate"))
+PRESETS_PATH = CONFIG_DIR / PRESETS_FILENAME
+BUNDLED_PRESETS = Path(__file__).parent / "data" / DEFAULT_PRESETS
 
 _REQUIRED_KEYS = {
     "known_parents",
@@ -85,14 +96,11 @@ def _load_roll_detection_config() -> dict:
     if not PRESETS_PATH.exists():
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         if not BUNDLED_PRESETS.exists():
-            sys.exit(
-                f"❌  Bundled presets not found: {BUNDLED_PRESETS}\n"
-                f"    Re-installing dit-mate should fix this."
-            )
+            sys.exit(f"❌  Bundled presets not found: {BUNDLED_PRESETS}\n    Re-installing dit-mate should fix this.")
         shutil.copy(BUNDLED_PRESETS, PRESETS_PATH)
 
     try:
-        with open(PRESETS_PATH, "rb") as fh:
+        with Path.open(PRESETS_PATH, "rb") as fh:
             data = tomllib.load(fh)
     except tomllib.TOMLDecodeError as exc:
         sys.exit(
@@ -141,9 +149,7 @@ def _load_roll_detection_config() -> dict:
     # message points to the config file rather than crashing inside the
     # roll-detection logic later on.
     try:
-        compiled_flex = [
-            re.compile(pat, re.IGNORECASE) for pat in cfg["known_parents_flex"]
-        ]
+        compiled_flex = [re.compile(pat, re.IGNORECASE) for pat in cfg["known_parents_flex"]]
     except re.error as exc:
         sys.exit(
             f"❌  Bad regex in [roll_detection].known_parents_flex: {exc}\n"
@@ -159,12 +165,12 @@ def _load_roll_detection_config() -> dict:
         )
 
     return {
-        "kp_exact":      set(s.lower() for s in cfg["known_parents"]),
-        "kp_flex":       compiled_flex,
+        "kp_exact": (s.lower() for s in cfg["known_parents"]),
+        "kp_flex": compiled_flex,
         "kp_cam_prefix": compiled_cam_prefix,
         "kp_cam_suffix": compiled_cam_suffix,
-        "ks_exact":      set(s.lower() for s in cfg["known_siblings_exact"]),
-        "ks_contains":   set(s.lower() for s in cfg["known_siblings_contains"]),
+        "ks_exact": (s.lower() for s in cfg["known_siblings_exact"]),
+        "ks_contains": (s.lower() for s in cfg["known_siblings_contains"]),
     }
 
 
@@ -174,6 +180,7 @@ _RD = _load_roll_detection_config()
 # ---------------------------------------------------------------------------
 # Preset editor helpers  (shared style with mkday)
 # ---------------------------------------------------------------------------
+
 
 def _open_presets_with_default_app() -> None:
     """Open mrl_presets.toml in the OS default app for .toml files.
@@ -210,11 +217,7 @@ def _open_presets_in_editor() -> None:
     if not PRESETS_PATH.exists():
         sys.exit(f"❌  Presets config file not found: {PRESETS_PATH}")
 
-    editor = (
-        os.environ.get("EDITOR")
-        or os.environ.get("VISUAL")
-        or ("notepad" if sys.platform == "win32" else "nano")
-    )
+    editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or ("notepad" if sys.platform == "win32" else "nano")
 
     print(f"📝  Opening {PRESETS_PATH} with '{editor}'…")
     try:
@@ -232,7 +235,7 @@ def _open_presets_in_editor() -> None:
 # .R3D is intentionally absent here — R3D files are inside RDC directories
 # and we surface RDC-as-clip via the discovery layer instead of treating
 # raw R3D files as clips.
-VIDEO_EXTS = {".mxf", ".mov", ".mp4"}
+VIDEO_EXTS = {".mxf", ".mov", ".mp4", ".insv"}
 
 # RED-specific: directory extension that wraps the R3D chunks of one clip.
 RDC_DIR_EXT = ".rdc"
@@ -243,11 +246,20 @@ R3D_FILE_EXT = ".r3d"
 # or move went wrong — flag for manual review.
 RED_SIDECAR_EXTS = {".rmd", ".rlx", ".rsx"}
 
+# Insta360 camera.
+# .insv is the primary video clip (lives in DCIM/Camera01/).
+# .lrv is a low-resolution proxy generated alongside every .insv by the
+# camera itself — analogous to GoPro's .LRV proxy files. We recognise the
+# extension so we can silently ignore these sidecars rather than treating
+# them as extra clips or raising a warning.
+INSV_EXT = ".insv"
+INSV_LRV_EXT = ".lrv"
+
 # GoPro chaptered recordings. When a take exceeds the FAT32 4 GB limit
 # (or the 12 GB ceiling on newer cards), the camera splits it across
 # multiple files following the pattern ``[GH|GX|GP][zz][xxxx].MP4``:
 #   - GH = AVC encoding, GX = HEVC, GP = older format
-#   - zz (chapter, 01–99) increments per chunk of the same recording
+#   - zz (chapter, 01-99) increments per chunk of the same recording
 #   - xxxx (file/take number) stays the same across chunks of one take
 #     and increments when a new recording starts
 # So GX010001 + GX020001 + GX030001 are three chunks of *one* take, while
@@ -299,6 +311,7 @@ def _session_signature(name: str) -> tuple[str, ...]:
 # Terminal colors (TTY only — disabled when piping to a file)
 # ---------------------------------------------------------------------------
 
+
 def _enable_ansi_on_windows() -> bool:
     """Enable ANSI escape processing on Windows 10+ consoles. No-op on Unix.
 
@@ -310,7 +323,6 @@ def _enable_ansi_on_windows() -> bool:
     if os.name != "nt":
         return True
     try:
-        import ctypes
         kernel32 = ctypes.windll.kernel32
         h = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
         mode = ctypes.c_ulong()
@@ -328,9 +340,9 @@ _ANSI_ERR = sys.stderr.isatty() and _enable_ansi_on_windows()
 DIM = "\033[38;5;246m" if _ANSI_OK else ""
 RESET = "\033[0m" if _ANSI_OK else ""
 # Header is printed to stderr, so it needs its own ANSI guards.
-DIM_ERR   = "\033[38;5;246m" if _ANSI_ERR else ""
-UNDERLINE_ERR = "\033[4m"   if _ANSI_ERR else ""
-RESET_ERR = "\033[0m"        if _ANSI_ERR else ""
+DIM_ERR = "\033[38;5;246m" if _ANSI_ERR else ""
+UNDERLINE_ERR = "\033[4m" if _ANSI_ERR else ""
+RESET_ERR = "\033[0m" if _ANSI_ERR else ""
 
 # Windows Explorer reports sizes in GiB (1 GiB = 2^30 bytes) while
 # macOS Finder and Linux tools report in decimal GB (1 GB = 10^9 bytes).
@@ -367,7 +379,11 @@ def _run(cmd: list[str]) -> str:
     """
     try:
         r = subprocess.run(
-            cmd, capture_output=True, text=True, check=False, **_POPEN_KW,
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            **_POPEN_KW,
         )
         return r.stdout
     except (FileNotFoundError, OSError, subprocess.SubprocessError):
@@ -377,6 +393,7 @@ def _run(cmd: list[str]) -> str:
 # ---------------------------------------------------------------------------
 # Clip abstraction
 # ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class Clip:
@@ -401,6 +418,7 @@ class Clip:
             RDC), ``"audio"`` for WAV. Drives the first/last selection
             rules.
     """
+
     name: str
     files: tuple[Path, ...]
     anchor: Path
@@ -437,6 +455,7 @@ class Issue:
         message: Human-readable description of what's wrong, used when
             we print diagnostics to stderr.
     """
+
     anchor: Path
     message: str
 
@@ -449,6 +468,7 @@ class Issue:
 # ---------------------------------------------------------------------------
 # Clip discovery
 # ---------------------------------------------------------------------------
+
 
 def _is_rdc_dir(p: Path) -> bool:
     """True iff ``p`` is a directory whose name ends in ``.RDC`` (any case)."""
@@ -496,7 +516,7 @@ def _parse_gopro_chapter(stem: str) -> tuple[str, str, int, int] | None:
 
     The pattern is ``G[H|X|P][zz][xxxx]`` where:
       - second letter is the codec (H = AVC, X = HEVC, P = older)
-      - zz is the chapter number (01–99); 01 marks the first chunk of a
+      - zz is the chapter number (01-99); 01 marks the first chunk of a
         take, 02+ continues the same recording past the FAT32 / 12 GB
         size ceiling
       - xxxx is the take/file number, identical across chunks of one
@@ -560,18 +580,25 @@ def _build_video_clips_in_dir(video_files: list[Path]) -> list[Clip]:
         # Anchor on the first chunk so roll-grouping (which keys off
         # parent dir) sees the clip in the same directory as the files.
         anchor = chunks_sorted[0]
-        clips.append(Clip(
-            name=anchor.stem,
-            files=tuple(chunks_sorted),
-            anchor=anchor,
-            kind="video",
-        ))
+        clips.append(
+            Clip(
+                name=anchor.stem,
+                files=tuple(chunks_sorted),
+                anchor=anchor,
+                kind="video",
+            )
+        )
 
     # Regular (non-chaptered) videos: one Clip per file.
     for f in regular:
-        clips.append(Clip(
-            name=f.stem, files=(f,), anchor=f, kind="video",
-        ))
+        clips.append(
+            Clip(
+                name=f.stem,
+                files=(f,),
+                anchor=f,
+                kind="video",
+            )
+        )
 
     return clips
 
@@ -604,17 +631,21 @@ def find_clips(root: Path) -> tuple[list[Clip], list[Issue]]:
             # No R3D — check for ProRes/H.265 recorded directly into the RDC.
             chunks = _video_files_in_rdc(root)
         if chunks:
-            clips.append(Clip(
-                name=root.stem,  # strips .RDC
-                files=tuple(chunks),
-                anchor=root,
-                kind="video",
-            ))
+            clips.append(
+                Clip(
+                    name=root.stem,  # strips .RDC
+                    files=tuple(chunks),
+                    anchor=root,
+                    kind="video",
+                )
+            )
         else:
-            issues.append(Issue(
-                anchor=root,
-                message=f"empty RDC directory (no media files inside): {root}",
-            ))
+            issues.append(
+                Issue(
+                    anchor=root,
+                    message=f"empty RDC directory (no media files inside): {root}",
+                )
+            )
         return clips, issues
 
     # Sony XDCAM sub-stream directory names that contain proxy/sub-stream
@@ -646,19 +677,23 @@ def find_clips(root: Path) -> tuple[list[Clip], list[Issue]]:
                 chunks = _video_files_in_rdc(rdc)
             if not chunks:
                 # Genuinely empty RDC — clip data missing.
-                issues.append(Issue(
-                    anchor=rdc,
-                    message=f"empty RDC directory (no media files inside): {rdc}",
-                ))
+                issues.append(
+                    Issue(
+                        anchor=rdc,
+                        message=f"empty RDC directory (no media files inside): {rdc}",
+                    )
+                )
                 continue
             # Strip the .RDC suffix for the rushes-log clip name.
-            name_no_ext = n[:-len(RDC_DIR_EXT)] if len(n) > len(RDC_DIR_EXT) else n
-            clips.append(Clip(
-                name=name_no_ext,
-                files=tuple(chunks),
-                anchor=rdc,
-                kind="video",
-            ))
+            name_no_ext = n[: -len(RDC_DIR_EXT)] if len(n) > len(RDC_DIR_EXT) else n
+            clips.append(
+                Clip(
+                    name=name_no_ext,
+                    files=tuple(chunks),
+                    anchor=rdc,
+                    kind="video",
+                )
+            )
         # Prevent os.walk from descending into the RDCs we just consumed.
         dirnames[:] = [n for n in dirnames if not n.lower().endswith(RDC_DIR_EXT)]
 
@@ -674,26 +709,41 @@ def find_clips(root: Path) -> tuple[list[Clip], list[Issue]]:
                 continue
             f = d / fn
             ext = f.suffix.lower()
+            if ext == INSV_LRV_EXT:
+                # Insta360 camera-generated low-resolution proxy. Silently
+                # skip — it is a sidecar to the matching .insv clip and
+                # should not be counted as a separate clip or flagged as
+                # an unexpected file.
+                continue
             if ext in VIDEO_EXTS:
                 dir_videos.append(f)
             elif ext in AUDIO_EXTS:
-                clips.append(Clip(
-                    name=f.stem, files=(f,), anchor=f, kind="audio",
-                ))
+                clips.append(
+                    Clip(
+                        name=f.stem,
+                        files=(f,),
+                        anchor=f,
+                        kind="audio",
+                    )
+                )
             elif ext == R3D_FILE_EXT:
                 # We pruned RDC dirs from `dirnames` before reaching the
                 # file loop, so any .R3D we see here is in a non-RDC
                 # parent — definitively stray.
-                issues.append(Issue(
-                    anchor=f,
-                    message=f"stray .R3D file outside any .RDC directory: {f}",
-                ))
+                issues.append(
+                    Issue(
+                        anchor=f,
+                        message=f"stray .R3D file outside any .RDC directory: {f}",
+                    )
+                )
             elif ext in RED_SIDECAR_EXTS:
                 # Same reasoning — RED color sidecars belong inside an RDC.
-                issues.append(Issue(
-                    anchor=f,
-                    message=f"stray RED sidecar ({ext}) outside any .RDC directory: {f}",
-                ))
+                issues.append(
+                    Issue(
+                        anchor=f,
+                        message=f"stray RED sidecar ({ext}) outside any .RDC directory: {f}",
+                    )
+                )
 
         if dir_videos:
             clips.extend(_build_video_clips_in_dir(dir_videos))
@@ -711,6 +761,7 @@ def find_clips(root: Path) -> tuple[list[Clip], list[Issue]]:
 # at startup (see _load_roll_detection_config above). The predicates below
 # delegate to the compiled values in _RD so the rest of the codebase is
 # unchanged.
+
 
 def _is_known_sibling(name: str) -> bool:
     """Return True if ``name`` should always be excluded from roll discovery.
@@ -769,14 +820,13 @@ def _find_roll_dirs(root: Path) -> list[tuple[Path, list[str]]]:
     """
     try:
         subdirs = sorted(
-            [d for d in root.iterdir()
-             if d.is_dir() and not _is_known_sibling(d.name)],
+            [d for d in root.iterdir() if d.is_dir() and not _is_known_sibling(d.name)],
             key=lambda d: d.name,
         )
     except OSError:
         return [(root, [])]
 
-    kp1     = [d for d in subdirs if _is_known_parent(d.name)]
+    kp1 = [d for d in subdirs if _is_known_parent(d.name)]
     non_kp1 = [d for d in subdirs if not _is_known_parent(d.name)]
 
     if not kp1:
@@ -804,14 +854,13 @@ def _find_roll_dirs(root: Path) -> list[tuple[Path, list[str]]]:
     for parent in kp1:
         try:
             children = sorted(
-                [d for d in parent.iterdir()
-                 if d.is_dir() and not _is_known_sibling(d.name)],
+                [d for d in parent.iterdir() if d.is_dir() and not _is_known_sibling(d.name)],
                 key=lambda d: d.name,
             )
         except OSError:
             continue
 
-        kp2     = [d for d in children if _is_known_parent(d.name)]
+        kp2 = [d for d in children if _is_known_parent(d.name)]
         non_kp2 = [d for d in children if not _is_known_parent(d.name)]
 
         if kp2:
@@ -843,12 +892,13 @@ def _find_roll_dirs(root: Path) -> list[tuple[Path, list[str]]]:
             for roll_dir in non_kp2:
                 results.append((roll_dir, []))
 
-    return results if results else [(root, [])]
+    return results or [(root, [])]
 
 
 # ---------------------------------------------------------------------------
 # Roll validation (cross-device contamination detection)
 # ---------------------------------------------------------------------------
+
 
 def _is_under_sony_wrapper(p: Path, wrapper: str) -> bool:
     """True iff ``p`` has an ancestor directory named exactly ``wrapper``.
@@ -911,14 +961,16 @@ def validate_roll(clips: list[Clip]) -> list[Issue]:
     if in_xdroot and in_m4root:
         ex_xd = in_xdroot[0].anchor
         ex_m4 = in_m4root[0].anchor
-        issues.append(Issue(
-            anchor=ex_xd,
-            message=(
-                f"both XDROOT and M4ROOT populated — card was used in "
-                f"two Sony cameras or two recording modes (XAVC + "
-                f"XAVC-S). Examples: {ex_xd} and {ex_m4}"
-            ),
-        ))
+        issues.append(
+            Issue(
+                anchor=ex_xd,
+                message=(
+                    f"both XDROOT and M4ROOT populated — card was used in "
+                    f"two Sony cameras or two recording modes (XAVC + "
+                    f"XAVC-S). Examples: {ex_xd} and {ex_m4}"
+                ),
+            )
+        )
 
     # --- Check: Mixed session signature across video clips -----------
     # Group video clips by their session signature. If we see more than
@@ -938,25 +990,25 @@ def validate_roll(clips: list[Clip]) -> list[Issue]:
         ):
             example_name = group[0].name
             n = len(group)
-            summary_parts.append(
-                f"{example_name!r} ({n} clip{'s' if n != 1 else ''})"
-            )
+            summary_parts.append(f"{example_name!r} ({n} clip{'s' if n != 1 else ''})")
         summary = ", ".join(summary_parts)
 
         # Anchor on the first clip of the smallest group (likely the
         # contaminating intruder, the one the user most needs to see).
         smallest_sig = min(by_signature, key=lambda s: len(by_signature[s]))
         anchor = by_signature[smallest_sig][0].anchor
-        issues.append(Issue(
-            anchor=anchor,
-            message=(
-                f"contains clips from multiple recording sessions — "
-                f"different filename signatures detected: {summary}. "
-                f"Card was likely used in two devices or two sessions "
-                f"without reformatting. First example of the minority "
-                f"group: {anchor}"
-            ),
-        ))
+        issues.append(
+            Issue(
+                anchor=anchor,
+                message=(
+                    f"contains clips from multiple recording sessions — "
+                    f"different filename signatures detected: {summary}. "
+                    f"Card was likely used in two devices or two sessions "
+                    f"without reformatting. First example of the minority "
+                    f"group: {anchor}"
+                ),
+            )
+        )
 
     return issues
 
@@ -983,7 +1035,7 @@ def _normalize_timestamp(s: str) -> str:
     y, mo, d = m.group(1), m.group(2), m.group(3)
     if int(y) == 0 and int(mo) == 0 and int(d) == 0:
         return ""
-    h  = m.group(4) or "00"
+    h = m.group(4) or "00"
     mi = m.group(5) or "00"
     sec = m.group(6) or "00"
     return f"{y}-{mo}-{d}T{h}:{mi}:{sec}"
@@ -996,7 +1048,7 @@ def audio_creation_times(wavs: list[Path]) -> dict[Path, str]:
     file, separated by newlines). Probes BWF/iXML tags stored in the WAV
     format container: ``creation_time``, ``origination_date``
     + ``origination_time``, ``date``. The first usable value wins. Missing or
-    unparseable values map to empty strings; the caller falls back to
+    unparsable values map to empty strings; the caller falls back to
     ``st_mtime``.
     """
     if not wavs:
@@ -1006,9 +1058,13 @@ def audio_creation_times(wavs: list[Path]) -> dict[Path, str]:
     # produces one JSON object. We separate them with a record separator
     # so we can split reliably even if tag values contain newlines.
     args = [
-        "ffprobe", "-v", "quiet",
-        "-print_format", f"json",
-        "-show_entries", "format_tags=creation_time,origination_date,origination_time,date",
+        "ffprobe",
+        "-v",
+        "quiet",
+        "-print_format",
+        "json",
+        "-show_entries",
+        "format_tags=creation_time,origination_date,origination_time,date",
     ]
     # ffprobe doesn't natively batch multiple files into one JSON array,
     # so we call it once per file.
@@ -1051,11 +1107,8 @@ def _sort_key_for_audio(path: Path, embedded_ts: str) -> str:
     if embedded_ts:
         return embedded_ts
     try:
-        from datetime import datetime, timezone
         ts = path.stat().st_mtime
-        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime(
-            "%Y-%m-%dT%H:%M:%S.%f"
-        )
+        return datetime.fromtimestamp(ts, tz=UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")
     except OSError:
         return ""
 
@@ -1063,6 +1116,7 @@ def _sort_key_for_audio(path: Path, embedded_ts: str) -> str:
 # ---------------------------------------------------------------------------
 # First / Last clips
 # ---------------------------------------------------------------------------
+
 
 def first_last_clips(clips: list[Clip]) -> tuple[str, str]:
     """Return ``(first_clip, last_clip)`` for one roll.
@@ -1090,6 +1144,7 @@ def first_last_clips(clips: list[Clip]) -> tuple[str, str]:
 
     videos = [c for c in clips if c.kind == "video"]
     if videos:
+
         def _video_ctime(c: Clip) -> float:
             """Filesystem creation date for sorting video clips.
 
@@ -1103,15 +1158,14 @@ def first_last_clips(clips: list[Clip]) -> tuple[str, str]:
                 return getattr(st, "st_birthtime", None) or st.st_mtime
             except OSError:
                 return 0.0
+
         ordered = sorted(videos, key=_video_ctime)
         return ordered[0].name, ordered[-1].name
 
     # Audio-only roll. Decide which sort strategy applies based on the
     # mix of audio formats present.
     audios = [c for c in clips if c.kind == "audio"]
-    has_zax = any(
-        c.files[0].suffix.lower() in {ZAX_EXT, MIC_EXT} for c in audios
-    )
+    has_zax = any(c.files[0].suffix.lower() in {ZAX_EXT, MIC_EXT} for c in audios)
 
     if has_zax:
         # Alphabetical works for ZAX (sequential recorder naming) and MIC
@@ -1133,6 +1187,7 @@ def first_last_clips(clips: list[Clip]) -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 # Size
 # ---------------------------------------------------------------------------
+
 
 def total_size_gb(clips: list[Clip], roll_root: Path | None = None) -> float:
     """Return the roll size in GB (macOS/Linux) or GiB (Windows).
@@ -1169,6 +1224,7 @@ def total_size_gb(clips: list[Clip], roll_root: Path | None = None) -> float:
 # Duration
 # ---------------------------------------------------------------------------
 
+
 def total_duration_seconds(clips: list[Clip]) -> float:
     """Aggregate video duration across all clips via ffprobe.
 
@@ -1197,12 +1253,18 @@ def total_duration_seconds(clips: list[Clip]) -> float:
 
     total = 0.0
     for f in video_files:
-        raw = _run([
-            "ffprobe", "-v", "quiet",
-            "-print_format", "json",
-            "-show_entries", "format=duration",
-            str(f),
-        ])
+        raw = _run(
+            [
+                "ffprobe",
+                "-v",
+                "quiet",
+                "-print_format",
+                "json",
+                "-show_entries",
+                "format=duration",
+                str(f),
+            ]
+        )
         if not raw.strip():
             continue
         try:
@@ -1214,11 +1276,9 @@ def total_duration_seconds(clips: list[Clip]) -> float:
     return total
 
 
-
-
 def format_hms(seconds: float) -> str:
     """Format seconds as ``HH:MM:SS``, rounded to whole seconds."""
-    total = int(round(seconds))
+    total = round(seconds)
     h, rem = divmod(total, 3600)
     m, s = divmod(rem, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
@@ -1227,6 +1287,7 @@ def format_hms(seconds: float) -> str:
 # ---------------------------------------------------------------------------
 # Per-roll line assembly
 # ---------------------------------------------------------------------------
+
 
 def render_roll(clips: list[Clip], fields: list[str], roll_root: Path | None = None) -> str:
     """Build the tab-separated value string for one roll (no roll label).
@@ -1239,7 +1300,7 @@ def render_roll(clips: list[Clip], fields: list[str], roll_root: Path | None = N
     """
     # Compute lazily — only what's needed.
     _first: str | None = None
-    _last:  str | None = None
+    _last: str | None = None
 
     def get_first_last() -> tuple[str, str]:
         nonlocal _first, _last
@@ -1275,6 +1336,7 @@ def render_roll(clips: list[Clip], fields: list[str], roll_root: Path | None = N
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
 
 def main(argv: list[str] | None = None) -> int:
     """Parse command-line arguments and emit one rushes-log line per roll.
@@ -1314,47 +1376,71 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
-        "-f", "-F", "--first-clip", action="store_true",
+        "-f",
+        "-F",
+        "--first-clip",
+        action="store_true",
         help="print first clip name",
     )
     parser.add_argument(
-        "-l", "-L", "--last-clip", action="store_true",
+        "-l",
+        "-L",
+        "--last-clip",
+        action="store_true",
         help="print last clip name.",
     )
     parser.add_argument(
-        "-s", "-S", "--size", action="store_true",
+        "-s",
+        "-S",
+        "--size",
+        action="store_true",
         help=f"print total size in {_SIZE_UNIT}",
     )
     parser.add_argument(
-        "-d", "-D", "--duration", action="store_true",
+        "-d",
+        "-D",
+        "--duration",
+        action="store_true",
         help="print aggregated duration of video clips (HH:MM:SS)",
     )
     parser.add_argument(
-        "-c", "-C", "--clip-count", action="store_true",
+        "-c",
+        "-C",
+        "--clip-count",
+        action="store_true",
         help="print the clip count",
     )
     parser.add_argument(
-        "-r", "-R", "--roll", action="store_true",
+        "-r",
+        "-R",
+        "--roll",
+        action="store_true",
         help="print the roll name",
     )
     parser.add_argument(
-        "-E", "--edit-presets",
+        "-E",
+        "--edit-presets",
         action="store_true",
         dest="edit_presets",
         help="edit mrl_presets.toml in your default terminal editor ($EDITOR)",
     )
     parser.add_argument(
-        "-O", "--open-presets",
+        "-O",
+        "--open-presets",
         action="store_true",
         dest="open_presets",
         help="open mrl_presets.toml in the system default app for text files",
     )
     parser.add_argument(
-        "--version", action="version", version=f"{__version__}",
+        "--version",
+        action="version",
+        version=f"{__version__}",
     )
     parser.add_argument(
-        "paths", nargs="*", default=["."],
-        help="camera roll directories (default: current directory)"
+        "paths",
+        nargs="*",
+        default=["."],
+        help="camera roll directories (default: current directory)",
     )
     args = parser.parse_args(argv)
 
@@ -1372,20 +1458,26 @@ def main(argv: list[str] | None = None) -> int:
     # This drives both render_roll and the header, preserving the exact
     # order the user typed their flags.
     _flag_to_field = {
-        "-f": "first", "--first-clip": "first",
-        "-l": "last",  "--last-clip":  "last",
-        "-s": "size",  "--size":       "size",
-        "-d": "duration", "--duration": "duration",
-        "-c": "n",     "--clip-count": "n",
-        "-r": "roll",  "--roll":        "roll",
+        "-f": "first",
+        "--first-clip": "first",
+        "-l": "last",
+        "--last-clip": "last",
+        "-s": "size",
+        "--size": "size",
+        "-d": "duration",
+        "--duration": "duration",
+        "-c": "n",
+        "--clip-count": "n",
+        "-r": "roll",
+        "--roll": "roll",
     }
     _field_to_header = {
-        "first":    "FIRST CLIP",
-        "last":     "LAST CLIP",
-        "n":        "CLIP COUNT",
+        "first": "FIRST CLIP",
+        "last": "LAST CLIP",
+        "n": "CLIP COUNT",
         "duration": "DURATION",
-        "size":     f"SIZE ({_SIZE_UNIT})",
-        "roll":     "ROLL",
+        "size": f"SIZE ({_SIZE_UNIT})",
+        "roll": "ROLL",
     }
     # Default order when no flags given
     _default_fields = ["roll", "first", "last", "n", "duration", "size"]
@@ -1409,7 +1501,6 @@ def main(argv: list[str] | None = None) -> int:
 
     if not fields:
         fields = _default_fields[:]
-
 
     rolls: list[tuple[str, Path, list[Clip], list[Issue]]] = []
 
@@ -1490,10 +1581,7 @@ def main(argv: list[str] | None = None) -> int:
     def _fmt_header(label: str) -> str:
         if not label:
             return ""
-        return (
-            f"{DIM_ERR}{UNDERLINE_ERR}{label[0]}{RESET_ERR}"
-            f"{DIM_ERR}{label[1:]}{RESET_ERR}"
-        )
+        return f"{DIM_ERR}{UNDERLINE_ERR}{label[0]}{RESET_ERR}{DIM_ERR}{label[1:]}{RESET_ERR}"
 
     header_labels = [_field_to_header[f] for f in fields]
 
@@ -1512,9 +1600,7 @@ def main(argv: list[str] | None = None) -> int:
         return cells
 
     # Collect all rows as cell lists so we can measure column widths.
-    all_rows: list[tuple[str, list[str]]] = [
-        (name, _raw_row(name, root, clips)) for name, root, clips in valid_rolls
-    ]
+    all_rows: list[tuple[str, list[str]]] = [(name, _raw_row(name, root, clips)) for name, root, clips in valid_rolls]
 
     # Column widths: max of header label length and any data cell in that column.
     col_widths = [len(h) for h in header_labels]
@@ -1557,7 +1643,6 @@ def main(argv: list[str] | None = None) -> int:
         if pyperclip is not installed.
         """
         try:
-            import pyperclip
             pyperclip.copy(text)
             return
         except Exception:
@@ -1565,16 +1650,15 @@ def main(argv: list[str] | None = None) -> int:
         # Stdlib fallback.
         try:
             if sys.platform == "darwin":
-                subprocess.run(["pbcopy"], input=text, text=True,
-                               check=False, **_POPEN_KW)
+                subprocess.run(["pbcopy"], input=text, text=True, check=False, **_POPEN_KW)
             elif sys.platform == "win32":
-                subprocess.run(["clip"], input=text, text=True,
-                               check=False, **_POPEN_KW)
+                subprocess.run(["clip"], input=text, text=True, check=False, **_POPEN_KW)
             else:
-                for cmd in (["xclip", "-selection", "clipboard"],
-                            ["xsel", "--clipboard", "--input"]):
-                    r = subprocess.run(cmd, input=text, text=True,
-                                       check=False, **_POPEN_KW)
+                for cmd in (
+                    ["xclip", "-selection", "clipboard"],
+                    ["xsel", "--clipboard", "--input"],
+                ):
+                    r = subprocess.run(cmd, input=text, text=True, check=False, **_POPEN_KW)
                     if r.returncode == 0:
                         break
         except Exception:
@@ -1583,10 +1667,7 @@ def main(argv: list[str] | None = None) -> int:
     if multi_valid or (multi and valid_rolls):
         # Header to stderr — purely visual, never captured by pipes.
         header_plain = [h for h in header_labels]
-        header_padded = [
-            h.ljust(col_widths[i]) if i < len(col_widths) - 1 else h
-            for i, h in enumerate(header_plain)
-        ]
+        header_padded = [h.ljust(col_widths[i]) if i < len(col_widths) - 1 else h for i, h in enumerate(header_plain)]
         header_str = "\t".join(_fmt_header(h) for h in header_padded)
         print(header_str, file=sys.stderr)
 
@@ -1607,10 +1688,7 @@ def main(argv: list[str] | None = None) -> int:
     name, cells = all_rows[0]
     row = _pad_row(cells, col_widths)
     if len(fields) > 1:
-        header_padded = [
-            h.ljust(col_widths[i]) if i < len(col_widths) - 1 else h
-            for i, h in enumerate(header_labels)
-        ]
+        header_padded = [h.ljust(col_widths[i]) if i < len(col_widths) - 1 else h for i, h in enumerate(header_labels)]
         header_str = "\t".join(_fmt_header(h) for h in header_padded)
         print(header_str, file=sys.stderr)
         print(row)

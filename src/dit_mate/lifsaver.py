@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Force-mount external camera data volumes stuck in macOS Disk Utility limbo.
-Bypasses automated daemon naming race conditions for ShotPut Pro queues.
+Bypasses automated daemon naming race conditions.
 
 macOS Tahoe / LIFS compatibility: prefers `diskutil mount` over raw mount
 binaries, which are increasingly sandbox-restricted in Tahoe's security model.
@@ -20,24 +20,27 @@ import subprocess
 import sys
 from pathlib import Path
 
+# -----------------------------------------------------------------------------
+# Version
+# -----------------------------------------------------------------------------
+
+try:
+    __version__ = importlib.metadata.version("dit-mate")
+except importlib.metadata.PackageNotFoundError:  # pragma: no cover
+    __version__ = "unknown"
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-# Version is imported from dit-mate
-__version__ = importlib.metadata.version("dit-mate")
-
-EXTERNAL_FS_ALLOWLIST = frozenset(
-    ["Microsoft Basic Data", "Windows_NTFS", "DOS_FAT", "exfat", "ExFAT"]
-)
+EXTERNAL_FS_ALLOWLIST = frozenset(["Windows_FAT_32", "exFAT", "ExFAT", "Microsoft Basic Data"])
 
 SEPARATOR = "-" * 56
-
 
 # ---------------------------------------------------------------------------
 # Mount-table helpers
 # ---------------------------------------------------------------------------
+
 
 def get_active_mounts() -> set[str]:
     """
@@ -48,9 +51,7 @@ def get_active_mounts() -> set[str]:
     """
     active: set[str] = set()
     try:
-        output = subprocess.run(
-            ["mount"], capture_output=True, text=True, check=True
-        ).stdout
+        output = subprocess.run(["mount"], capture_output=True, text=True, check=True).stdout
         for line in output.splitlines():
             if line.startswith("/dev/"):
                 dev_path = line.split()[0]
@@ -71,6 +72,7 @@ def is_currently_mounted(dev_id: str) -> bool:
 # ---------------------------------------------------------------------------
 # Disk introspection
 # ---------------------------------------------------------------------------
+
 
 def get_disk_data() -> dict:
     """Retrieve all physical partition details via structured plist data."""
@@ -112,6 +114,7 @@ def get_partition_fs_type(dev_id: str) -> str:
 # Partition filtering
 # ---------------------------------------------------------------------------
 
+
 def filter_target_partitions(disk_data: dict) -> list[str]:
     """
     Walk the plist returned by `diskutil list -plist` and return device
@@ -124,7 +127,7 @@ def filter_target_partitions(disk_data: dict) -> list[str]:
     EFI system partitions and Apple_APFS / Apple_HFS containers are
     explicitly excluded.
     """
-    active_mounts = get_active_mounts()   # one consistent snapshot for filtering
+    active_mounts = get_active_mounts()  # one consistent snapshot for filtering
     targets: list[str] = []
 
     for disk in disk_data.get("AllDisksAndPartitions", []):
@@ -143,16 +146,20 @@ def filter_target_partitions(disk_data: dict) -> list[str]:
             # Blocklist: EFI, recovery, and Apple container types
             blocked = any(
                 token in content_type
-                for token in ["EFI", "Apple_APFS", "Apple_HFS", "Apple_Boot",
-                              "Apple_Recovery", "Apple_CoreStorage"]
+                for token in [
+                    "EFI",
+                    "Apple_APFS",
+                    "Apple_HFS",
+                    "Apple_Boot",
+                    "Apple_Recovery",
+                    "Apple_CoreStorage",
+                ]
             )
             if blocked:
                 continue
 
             # Allowlist: recognised camera-card payload types
-            is_camera_payload = any(
-                token in content_type for token in EXTERNAL_FS_ALLOWLIST
-            )
+            is_camera_payload = any(token in content_type for token in EXTERNAL_FS_ALLOWLIST)
             if not is_camera_payload:
                 continue
 
@@ -169,6 +176,7 @@ def filter_target_partitions(disk_data: dict) -> list[str]:
 # ---------------------------------------------------------------------------
 # Mount execution
 # ---------------------------------------------------------------------------
+
 
 def _run_diskutil_mount(dev_id: str, verbose: bool) -> bool:
     """
@@ -215,8 +223,10 @@ def _run_raw_mount(dev_id: str, fs_type: str, verbose: bool) -> bool:
     for cmd in candidates:
         result = subprocess.run(cmd, capture_output=True, text=True)
         if verbose and result.stderr:
-            print(f"  [{cmd[0].split('/')[-1]} stderr] {result.stderr.strip()}",
-                  file=sys.stderr)
+            print(
+                f"  [{cmd[0].split('/')[-1]} stderr] {result.stderr.strip()}",
+                file=sys.stderr,
+            )
         if result.returncode == 0:
             return True
 
@@ -254,19 +264,17 @@ def execute_mount(dev_id: str, dry_run: bool = False, verbose: bool = False) -> 
         return True
 
     # --- Attempt 1: diskutil mount (Tahoe-safe) ---
-    print(f"  Attempting diskutil mount...")
-    if _run_diskutil_mount(dev_id, verbose):
-        if is_currently_mounted(dev_id):
-            mount_point = _find_mount_point(dev_id)
-            print(f"  SUCCESS via diskutil → {mount_point or '(see /Volumes)'}")
-            return True
+    print("  Attempting diskutil mount...")
+    if _run_diskutil_mount(dev_id, verbose) and is_currently_mounted(dev_id):
+        mount_point = _find_mount_point(dev_id)
+        print(f"  SUCCESS via diskutil → {mount_point or '(see /Volumes)'}")
+        return True
 
     # --- Attempt 2: raw mount binaries ---
-    print(f"  diskutil mount failed; falling back to raw mount binaries...")
-    if _run_raw_mount(dev_id, fs_type, verbose):
-        if is_currently_mounted(dev_id):
-            print(f"  SUCCESS via raw mount → /Volumes/Camera_Data_{dev_id}")
-            return True
+    print("  diskutil mount failed; falling back to raw mount binaries...")
+    if _run_raw_mount(dev_id, fs_type, verbose) and is_currently_mounted(dev_id):
+        print(f"  SUCCESS via raw mount → /Volumes/Camera_Data_{dev_id}")
+        return True
 
     print(f"  CRITICAL ERROR: All mount strategies rejected /dev/{dev_id}")
     return False
@@ -276,9 +284,7 @@ def _find_mount_point(dev_id: str) -> str:
     """Extract the current mount point for a device from the live mount table."""
     dev_path = f"/dev/{dev_id}"
     try:
-        output = subprocess.run(
-            ["mount"], capture_output=True, text=True, check=True
-        ).stdout
+        output = subprocess.run(["mount"], capture_output=True, text=True, check=True).stdout
         for line in output.splitlines():
             if line.startswith(dev_path + " "):
                 # format: /dev/diskXsY on /Volumes/NAME (type, options)
@@ -294,10 +300,9 @@ def _find_mount_point(dev_id: str) -> str:
 # Entry point
 # ---------------------------------------------------------------------------
 
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Force-mount stalled 'Untitled' volumes on macOS."
-    )
+    parser = argparse.ArgumentParser(description="Force-mount stalled 'Untitled' volumes on macOS.")
     parser.add_argument(
         "--version",
         action="version",
@@ -326,8 +331,8 @@ def check_platform() -> None:
     """
     if sys.platform != "darwin":
         platform_hints = {
-            "linux":  "On Linux, try:  udisksctl mount -b /dev/<device>",
-            "win32":  "On Windows, use Disk Management or: mountvol <drive>: /L",
+            "linux": "On Linux, try:  udisksctl mount -b /dev/<device>",
+            "win32": "On Windows, use Disk Management or: mountvol <drive>: /L",
             "cygwin": "On Windows (Cygwin), use Disk Management or mountvol.",
         }
         hint = platform_hints.get(sys.platform, "")
@@ -337,8 +342,7 @@ def check_platform() -> None:
             f"\n"
             f"     The tools it relies on — diskutil, mount_exfat, mount_msdos,\n"
             f"     Disk Arbitration, /Volumes, and plist kernel output — do not\n"
-            f"     exist on other operating systems.\n"
-            + (f"\n     {hint}\n" if hint else ""),
+            f"     exist on other operating systems.\n" + (f"\n     {hint}\n" if hint else ""),
             file=sys.stderr,
         )
         sys.exit(1)
@@ -377,11 +381,7 @@ def main() -> None:
             results["fail"] += 1
         print(SEPARATOR)
 
-    print(
-        f"Done — {results['ok']} mounted, "
-        f"{results['fail']} failed, "
-        f"{results['skip']} skipped."
-    )
+    print(f"Done — {results['ok']} mounted, {results['fail']} failed, {results['skip']} skipped.")
 
 
 if __name__ == "__main__":

@@ -3,10 +3,10 @@
 # mkday - Make new shooting day folder structure
 
 """
-`makeday` creates a user-defined folder structure in the volumes provided, 
+`makeday` creates a user-defined folder structure in the volumes provided,
 a time-saver at the beginning of each shooting day.
 
-Example: 
+Example:
 
 Make the folder structure for shooting day 1, using the preset "example",
 on two backup drives:
@@ -22,6 +22,7 @@ import importlib.metadata
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tomllib
 from datetime import datetime
@@ -29,22 +30,32 @@ from pathlib import Path
 
 from platformdirs import user_config_dir
 
+# -----------------------------------------------------------------------------
+# Version
+# -----------------------------------------------------------------------------
+
+try:
+    __version__ = importlib.metadata.version("dit-mate")
+except importlib.metadata.PackageNotFoundError:  # pragma: no cover
+    __version__ = "unknown"
+
 # ---------------------------------------------------------------------------
 # Preset definitions
 # ---------------------------------------------------------------------------
 
-# Version is imported from dit-mate
-__version__ = importlib.metadata.version("dit-mate")
-
-
 PRESETS_FILENAME = "mkday_presets.toml"
-DEFAULT_PRESETS  = "mkday_default_presets.toml"
-CONFIG_DIR       = Path(user_config_dir("dit-mate"))
-PRESETS_PATH     = CONFIG_DIR / PRESETS_FILENAME
-BUNDLED_PRESETS  = Path(__file__).parent / "data" / DEFAULT_PRESETS
+DEFAULT_PRESETS = "mkday_default_presets.toml"
+CONFIG_DIR = Path(user_config_dir("dit-mate"))
+PRESETS_PATH = CONFIG_DIR / PRESETS_FILENAME
+BUNDLED_PRESETS = Path(__file__).parent / "data" / DEFAULT_PRESETS
 
-REQUIRED_KEYS = {
-    "aliases", "prefix_path", "day_folder_format", "day_padding", "subfolders"
+REQUIRED_KEYS = {"day_folder_format"}
+
+DEFAULTS = {
+    "aliases": [],
+    "prefix_path": "",
+    "day_padding": 0,
+    "subfolders": [],
 }
 
 
@@ -57,14 +68,11 @@ def load_presets() -> dict:
     if not PRESETS_PATH.exists():
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         if not BUNDLED_PRESETS.exists():
-            sys.exit(
-                f"❌  Bundled presets not found: {BUNDLED_PRESETS}\n"
-                f"    Re-installing dit-mate should fix this."
-            )
+            sys.exit(f"❌  Bundled presets not found: {BUNDLED_PRESETS}\n    Re-installing dit-mate should fix this.")
         shutil.copy(BUNDLED_PRESETS, PRESETS_PATH)
 
     try:
-        with open(PRESETS_PATH, "rb") as f:
+        with Path.open(PRESETS_PATH, "rb") as f:
             data = tomllib.load(f)
     except tomllib.TOMLDecodeError as exc:
         sys.exit(
@@ -75,6 +83,7 @@ def load_presets() -> dict:
 
     errors = []
     for preset_key, cfg in data.items():
+        # Validate required keys
         missing = REQUIRED_KEYS - set(cfg.keys())
         if missing:
             errors.append(
@@ -82,25 +91,26 @@ def load_presets() -> dict:
                 f"  {', '.join(sorted(missing))}"
                 f"  Run 'mkday -e' to edit the file and fix the error."
             )
+        # Validate optional keys when present
         if "day_padding" in cfg:
             val = cfg["day_padding"]
             if not (isinstance(val, int) and val >= 0):
                 errors.append(
-                    f"  Preset '{preset_key}': day_padding must be a positive integer"
+                    f"  Preset '{preset_key}': day_padding must be a non-negative integer"
                     f"  Run 'mkday -e' to edit the file and fix the error."
                 )
         if "subfolders" in cfg and not isinstance(cfg["subfolders"], list):
             errors.append(
                 f"  Preset '{preset_key}': subfolders must be a list with quoted values.\n\n"
                 f"  E.g.\n"
-                f"  subfolders = [\"AUDIO\", \"CAMERA\", \"DOCS\", \"PROXY\", \"STILLS\"]\n"
+                f'  subfolders = ["AUDIO", "CAMERA", "DOCS", "PROXY", "STILLS"]\n'
                 f"  Run 'mkday -e' to edit the file and fix the error."
             )
         if "aliases" in cfg and not isinstance(cfg["aliases"], list):
             errors.append(
                 f"  Preset '{preset_key}': aliases must be a list with quoted values.\n\n"
                 f"  Example:\n"
-                f"  aliases = [\"example_alias1\", \"example_alias2\"]\n"
+                f'  aliases = ["example_alias1", "example_alias2"]\n'
                 f"  Run 'mkday -e' to edit the file and fix the error."
             )
 
@@ -111,6 +121,11 @@ def load_presets() -> dict:
             + "\n    Run 'mkday -e' to edit the file and fix the errors."
         )
 
+    # Apply defaults for any omitted optional keys
+    for cfg in data.values():
+        for key, default in DEFAULTS.items():
+            cfg.setdefault(key, default)
+
     return data
 
 
@@ -119,6 +134,7 @@ PRESETS = load_presets()
 # ---------------------------------------------------------------------------
 # Helper functions
 # ---------------------------------------------------------------------------
+
 
 def resolve_preset(raw: str) -> str:
     """Return the canonical preset key or raise ValueError.
@@ -130,22 +146,86 @@ def resolve_preset(raw: str) -> str:
     lookup = {
         candidate: preset_key
         for preset_key, cfg in PRESETS.items()
-        for candidate in [preset_key, *cfg["aliases"]]
+        for candidate in [preset_key, *cfg.get("aliases", [])]
     }
     if key not in lookup:
         valid = sorted(lookup.keys())
-        raise ValueError(
-            f"Unknown preset '{raw}'. Valid values: {', '.join(valid)}"
-        )
+        raise ValueError(f"Unknown preset '{raw}'. Valid values: {', '.join(valid)}")
     return lookup[key]
 
 
-def build_day_folder_name(preset_cfg: dict, day: int) -> str:
-    """Build the day folder name from preset config and day number."""
-    today = datetime.today().strftime("%Y%m%d")
+def _date_tokens(now: datetime) -> dict[str, str]:
+    """Return a map of date token → value for the given datetime.
+
+    D and M (non-padded) use platform-specific strftime flags:
+      Linux / macOS → %-d, %-m
+      Windows       → %#d, %#m
+    """
+    no_pad = "#" if sys.platform == "win32" else "-"
+    return {
+        "YYYY": now.strftime("%Y"),
+        "YY": now.strftime("%y"),
+        "MM": now.strftime("%m"),
+        "DD": now.strftime("%d"),
+        "M": now.strftime(f"%{no_pad}m"),
+        "D": now.strftime(f"%{no_pad}d"),
+    }
+
+
+def _expand_date_tokens(fmt: str, now: datetime) -> str:
+    """Expand date letter-sequences inside any {…} group.
+
+    Tokens are replaced longest-first so YYYY is never partially matched by YY.
+    Groups with no recognised date tokens (e.g. {day}) are left untouched.
+
+    Examples (2026-05-21):
+      {YYYYMMDD}    → 20260521
+      {YYYY-MM-DD}  → 2026-05-21
+      {YY/MM/DD}    → 26/05/21
+      {D/M/YYYY}    → 21/5/2026
+    """
+    tokens = _date_tokens(now)
+
+    def replacer(m: re.Match) -> str:
+        inner = m.group(1)
+        result = inner
+        for token, value in sorted(tokens.items(), key=lambda x: -len(x[0])):
+            result = result.replace(token, value)
+        # Only substitute if something actually changed; otherwise leave {…} intact
+        return result if result != inner else m.group(0)
+
+    return re.sub(r"\{([^}]+)\}", replacer, fmt)
+
+
+def build_day_folder_name(preset_cfg: dict, day: int | None) -> str:
+    """Build the day folder name from preset config and day number.
+
+    Date tokens can be combined freely inside a single {…} group or kept
+    separate — punctuation between letters is preserved as-is:
+
+      {YYYYMMDD}_DAY{day}       → 20260521_DAY03
+      {YYYY-MM-DD}_DAY{day}     → 2026-05-21_DAY03
+      {D/M/YYYY}_DAY{day}       → 21/5/2026_DAY03
+      {YY}{MM}{DD}_{day}        → 260521_3   (day_padding = 0)
+      {YYYYMMDD}                → 20260521    (no {day} token, day arg unused)
+
+    Tokens:
+      YYYY  four-digit year        MM  zero-padded month (01-12)
+      YY    two-digit year         DD  zero-padded day   (01-31)
+                                   M   non-padded month  (1-12)
+                                   D   non-padded day    (1-31)
+      {day} is the shooting day number, padded per day_padding.
+            Omit {day} from the format if the preset does not use day numbers.
+    """
+    now = datetime.today()
+    expanded = _expand_date_tokens(preset_cfg["day_folder_format"], now)
+
+    if "{day}" not in expanded:
+        return expanded
+
     padding = preset_cfg["day_padding"]
     day_str = str(day) if padding == 0 else str(day).zfill(padding)
-    return preset_cfg["day_folder_format"].format(today=today, day=day_str)
+    return expanded.format(day=day_str)
 
 
 def resolve_base_path(cwd: Path, preset_cfg: dict) -> tuple[Path, bool]:
@@ -201,7 +281,6 @@ def print_tree(day_path: Path, subfolders: list[str], prefix_path: str | None) -
     # Day folder row
     depth = len(segments)
     day_connector = "└──" if depth > 0 else ""
-    day_indent    = indent * depth if depth > 0 else indent[:-4]  # flush left when no prefix
     if day_connector:
         print(f"{indent * depth}{day_connector} 📁 {day_path.name}")
     else:
@@ -218,6 +297,7 @@ def print_tree(day_path: Path, subfolders: list[str], prefix_path: str | None) -
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -236,31 +316,33 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "-d", "--day",
+        "-d",
+        "--day",
         required=False,
         metavar="N",
         help="shooting day number",
     )
     parser.add_argument(
-        "-p", "--production-preset",
+        "-p",
+        "--production-preset",
         required=False,
         metavar="PRESET",
         dest="preset",
         help="preset name",
     )
     parser.add_argument(
-        "-E", "--edit-presets",
+        "-E",
+        "--edit-presets",
         action="store_true",
         dest="edit_presets",
         help="edit mkday_presets.toml in your default editor ($EDITOR)",
     )
     parser.add_argument(
-        "-O", "--open-presets",
+        "-O",
+        "--open-presets",
         action="store_true",
         dest="open_presets",
-        help=(
-            "open mkday_presets.toml in the system default app for text files"
-        ),
+        help=("open mkday_presets.toml in the system default app for text files"),
     )
     parser.add_argument(
         "--version",
@@ -273,25 +355,79 @@ def build_parser() -> argparse.ArgumentParser:
 def open_presets_with_default_app() -> None:
     """Open mkday_presets.toml in the OS default app for .toml files.
 
-    Uses:
-      macOS   → open
-      Windows → os.startfile
-      Linux   → xdg-open
+    Falls back gracefully when no application is registered for .toml:
+
+      macOS   → open  (always works; Preview / TextEdit handles unknown types)
+      Windows → os.startfile → Notepad on failure
+      Linux   → xdg-open → tries a short list of GUI text editors on failure
     """
     if not PRESETS_PATH.exists():
         sys.exit(f"❌  Presets config file not found: {PRESETS_PATH}")
 
-    print(f"📋  Open presets config file: {PRESETS_PATH}")
+    print(f"📋  Opening presets config file: {PRESETS_PATH}")
 
-    try:
-        if sys.platform == "darwin":
-            os.execvp("open", ["open", str(PRESETS_PATH)])
-        elif sys.platform == "win32":
+    if sys.platform == "darwin":
+        # Try the registered default app first.
+        result = subprocess.run(["open", str(PRESETS_PATH)], capture_output=True)
+        if result.returncode == 0:
+            return
+        # No app registered for .toml — fall back to TextEdit explicitly.
+        print("No app registered for .toml — opening with TextEdit")
+        result = subprocess.run(["open", "-a", "TextEdit", str(PRESETS_PATH)], capture_output=True)
+        if result.returncode != 0:
+            sys.exit(
+                "❌  Could not open presets file with TextEdit either.\n"
+                "    Try 'mkday -E' to open it in a terminal editor instead."
+            )
+        return
+
+    elif sys.platform == "win32":
+        # os.startfile uses the registered handler; falls back to Notepad.
+        try:
             os.startfile(str(PRESETS_PATH))
-        else:
-            os.execvp("xdg-open", ["xdg-open", str(PRESETS_PATH)])
-    except FileNotFoundError as exc:
-        sys.exit(f"❌  Could not open presets file: {exc}")
+        except OSError:
+            subprocess.Popen(["notepad.exe", str(PRESETS_PATH)])
+
+    else:
+        # Try xdg-open; if it exits non-zero or isn't installed, fall through.
+        try:
+            result = subprocess.run(
+                ["xdg-open", str(PRESETS_PATH)],
+                timeout=5,
+                capture_output=True,
+            )
+            if result.returncode == 0:
+                return
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
+        # xdg-open failed (no handler registered or not installed).
+        # Try GUI editors in preference order, then terminal editors.
+        fallbacks = [
+            "gedit",
+            "kate",
+            "mousepad",
+            "xed",
+            "pluma",  # common GUI editors
+            "geany",
+            "featherpad",
+            "leafpad",  # lighter GUI editors
+            "nano",
+            "micro",
+            "vim",
+            "vi",  # terminal fallbacks
+        ]
+        for editor in fallbacks:
+            if shutil.which(editor):
+                print(f"No app registered for .toml — opening with '{editor}'")
+                os.execvp(editor, [editor, str(PRESETS_PATH)])
+                return  # execvp replaces the process; this line is never reached
+
+        sys.exit(
+            f"❌  Could not find an application to open {PRESETS_PATH}\n"
+            f"    Install a text editor (e.g. gedit, kate) or set $EDITOR,\n"
+            f"    then use 'mkday -E' to open in a terminal editor instead."
+        )
 
 
 def open_presets_in_editor() -> None:
@@ -307,11 +443,7 @@ def open_presets_in_editor() -> None:
     if not presets_file.exists():
         sys.exit(f"❌  Presets config file not found: {presets_file}")
 
-    editor = (
-        os.environ.get("EDITOR")
-        or os.environ.get("VISUAL")
-        or ("notepad" if sys.platform == "win32" else "nano")
-    )
+    editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or ("notepad" if sys.platform == "win32" else "nano")
 
     print(f"📝  Opening {presets_file} with '{editor}'…")
     try:
@@ -339,9 +471,7 @@ def main() -> None:
         open_presets_in_editor()
         return
 
-    # -d and -p are required for normal operation
-    if not args.day:
-        parser.error("the following arguments are required: -d/--day")
+    # -p is always required for normal operation
     if not args.preset:
         parser.error("the following arguments are required: -p/--production-preset")
 
@@ -351,7 +481,14 @@ def main() -> None:
     except ValueError as exc:
         parser.error(str(exc))
 
-    preset_cfg   = PRESETS[preset_key]
+    preset_cfg = PRESETS[preset_key]
+
+    # -d is only required if the preset's day_folder_format uses {day}
+    uses_day = "{day}" in preset_cfg["day_folder_format"]
+    if uses_day and not args.day:
+        parser.error(f"preset '{preset_key}' requires a day number: -d/--day N")
+    if not uses_day and args.day:
+        print(f"⚠️   Preset '{preset_key}' does not use {{day}} in its folder format (-d ignored)")
 
     # Resolve destination directories
     if args.outputs:
@@ -376,17 +513,14 @@ def main() -> None:
 
     # Build day folder
     day_folder_name = build_day_folder_name(preset_cfg, args.day)
-    subfolders      = preset_cfg["subfolders"]
+    subfolders = preset_cfg["subfolders"]
 
     # Check if day folder exists in the destinations
     for dest in destinations:
         base_path, _ = resolve_base_path(dest, preset_cfg)
         day_path = base_path / day_folder_name
         if day_path.exists():
-            sys.exit(
-                f"❗  Day folder already exists: {day_path}\n"
-                f"❌  Make day folder structure aborted"
-            )
+            sys.exit(f"❗  Day folder already exists: {day_path}\n❌  Make day folder structure aborted")
 
     # Create day folder in all destinations, collect warnings
     warnings = []
