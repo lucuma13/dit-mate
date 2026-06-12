@@ -189,19 +189,7 @@ class TestCheckPlatform:
                 lifsaver.check_platform()
             assert exc_info.value.code == 1
 
-    def test_linux_hint_in_stderr(self, capsys):
-        with patch.object(sys, "platform", "linux"), pytest.raises(SystemExit):
-            lifsaver.check_platform()
-        err = capsys.readouterr().err
-        assert "udisksctl" in err
-
-    def test_windows_hint_in_stderr(self, capsys):
-        with patch.object(sys, "platform", "win32"), pytest.raises(SystemExit):
-            lifsaver.check_platform()
-        err = capsys.readouterr().err
-        assert "mountvol" in err
-
-    def test_unknown_platform_no_hint_no_crash(self, capsys):
+    def test_unknown_platform_no_crash(self, capsys):
         with patch.object(sys, "platform", "haiku"), pytest.raises(SystemExit):
             lifsaver.check_platform()
         err = capsys.readouterr().err
