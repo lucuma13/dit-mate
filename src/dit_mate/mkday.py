@@ -381,7 +381,7 @@ def open_presets_with_default_app() -> None:
             )
         return
 
-    elif sys.platform == "win32":
+    if sys.platform == "win32":
         # os.startfile uses the registered handler; falls back to Notepad.
         try:
             os.startfile(str(PRESETS_PATH))

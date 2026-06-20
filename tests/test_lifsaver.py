@@ -1,7 +1,4 @@
-"""
-pytest suite for lifsaver.py
-================================
-"""
+"""Test suite for lifsaver."""
 
 import plistlib
 import subprocess
