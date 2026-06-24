@@ -13,6 +13,7 @@ Usage:
 """
 
 import argparse
+import contextlib
 import importlib.metadata
 import os
 import plistlib
@@ -56,7 +57,7 @@ def get_active_mounts() -> set[str]:
             if line.startswith("/dev/"):
                 dev_path = line.split()[0]
                 active.add(dev_path)
-    except Exception as exc:
+    except (OSError, subprocess.SubprocessError) as exc:
         print(f"WARNING: Could not read mount table: {exc}", file=sys.stderr)
     return active
 
@@ -106,7 +107,7 @@ def get_partition_fs_type(dev_id: str) -> str:
         # 'FilesystemType' is the canonical key; fall back to content hint
         fs = info.get("FilesystemType") or info.get("Content") or ""
         return fs.lower()
-    except Exception:
+    except (OSError, subprocess.SubprocessError, plistlib.InvalidFileException):
         return ""
 
 
@@ -188,6 +189,7 @@ def _run_diskutil_mount(dev_id: str, verbose: bool) -> bool:
         ["diskutil", "mount", dev_id],
         capture_output=True,
         text=True,
+        check=False,
     )
     if verbose and result.stderr:
         print(f"  [diskutil stderr] {result.stderr.strip()}", file=sys.stderr)
@@ -221,7 +223,7 @@ def _run_raw_mount(dev_id: str, fs_type: str, verbose: bool) -> bool:
         ]
 
     for cmd in candidates:
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if verbose and result.stderr:
             print(
                 f"  [{cmd[0].split('/')[-1]} stderr] {result.stderr.strip()}",
@@ -231,10 +233,8 @@ def _run_raw_mount(dev_id: str, fs_type: str, verbose: bool) -> bool:
             return True
 
     # Both failed — clean up the empty directory we created
-    try:
+    with contextlib.suppress(OSError):
         mount_point.rmdir()
-    except OSError:
-        pass
 
     return False
 
@@ -282,6 +282,8 @@ def execute_mount(dev_id: str, dry_run: bool = False, verbose: bool = False) -> 
 
 def _find_mount_point(dev_id: str) -> str:
     """Extract the current mount point for a device from the live mount table."""
+    DEV_MOUNT_PARTS = 2  # "/dev/diskXsY on /Volumes/NAME" → device + mount point
+
     dev_path = f"/dev/{dev_id}"
     try:
         output = subprocess.run(["mount"], capture_output=True, text=True, check=True).stdout
@@ -289,9 +291,9 @@ def _find_mount_point(dev_id: str) -> str:
             if line.startswith(dev_path + " "):
                 # format: /dev/diskXsY on /Volumes/NAME (type, options)
                 parts = line.split(" on ", 1)
-                if len(parts) == 2:
+                if len(parts) == DEV_MOUNT_PARTS:
                     return parts[1].split(" (")[0].strip()
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
         pass
     return ""
 
@@ -345,7 +347,7 @@ def main() -> None:
     # Re-exec with sudo, preserving all original arguments
     if os.getuid() != 0:
         print("Root access required. Re-running with sudo...")
-        os.execvp("sudo", ["sudo", sys.executable] + sys.argv)
+        os.execvp("sudo", ["sudo", sys.executable, *sys.argv])
 
     print(SEPARATOR)
     mode = " [DRY-RUN]" if args.dry_run else ""

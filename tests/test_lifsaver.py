@@ -18,7 +18,7 @@ from dit_mate import lifsaver
 @pytest.fixture(autouse=True)
 def mask_ci_environment(monkeypatch):
     """Isolate tests from the GitHub Actions CI environment flag, so that they
-    can succesfully be no-op on non-macOS platforms and CI still passes a smoke
+    can successfully be no-op on non-macOS platforms and CI still passes a smoke
     test."""
     monkeypatch.delenv("CI", raising=False)
 
@@ -328,7 +328,7 @@ class TestGetActiveMounts:
         assert len(result) == 1
 
     def test_returns_empty_set_on_failure(self, capsys):
-        with patch("subprocess.run", side_effect=Exception("boom")):
+        with patch("subprocess.run", side_effect=OSError("boom")):
             result = lifsaver.get_active_mounts()
         assert result == set()
         assert "WARNING" in capsys.readouterr().err
@@ -407,7 +407,7 @@ class TestGetPartitionFsType:
             assert lifsaver.get_partition_fs_type("disk4s1") == "dos_fat_32"
 
     def test_returns_empty_string_on_failure(self):
-        with patch("subprocess.run", side_effect=Exception("boom")):
+        with patch("subprocess.run", side_effect=OSError("boom")):
             assert lifsaver.get_partition_fs_type("disk4s1") == ""
 
     def test_returns_empty_string_when_both_keys_missing(self):
@@ -710,7 +710,7 @@ class TestFindMountPoint:
         assert result == ""
 
     def test_returns_empty_string_on_exception(self):
-        with patch("subprocess.run", side_effect=Exception("boom")):
+        with patch("subprocess.run", side_effect=OSError("boom")):
             result = lifsaver._find_mount_point("disk4s1")
         assert result == ""
 
