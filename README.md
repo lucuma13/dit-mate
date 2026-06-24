@@ -78,7 +78,3 @@ Run any tool with `--help` to see the full list of options.
 ### ⚠️ Disclaimer
 
 The `lifsaver` utility  deliberately circumvents standard macOS Disk Arbitration and LIFS (Live Image File System) protections to force-mount stalled volumes. The author assumes no liability for lost or corrupted data, or hardware failures of any kind.
-
-### 🧪 Feedback & Contributing
-
-If this tool fails to parse metadata from your specific camera files, or if you have ideas for improvement, please fork the repository and submit a pull request, or open an issue with a sample of the problematic metadata output. Help me make this tool more robust for the DIT community!
