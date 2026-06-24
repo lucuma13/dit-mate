@@ -22,11 +22,12 @@ without touching the filesystem.
 
 import argparse
 import importlib.metadata
-import os
 import sys
 from pathlib import Path
 
-from platformdirs import user_config_dir
+from dit_mate._internal.config import CONFIG_DIR
+from dit_mate._internal.openers import open_in_default_app, open_in_editor
+from dit_mate._internal.paths import resolve_target_dirs
 
 # -----------------------------------------------------------------------------
 # Version
@@ -38,11 +39,10 @@ except importlib.metadata.PackageNotFoundError:  # pragma: no cover
     __version__ = "unknown"
 
 # ---------------------------------------------------------------------------
-# Version & Paths
+# Constants
 # ---------------------------------------------------------------------------
 
 TSV_FILENAME = "rename_dictionary.tsv"
-CONFIG_DIR = Path(user_config_dir("dit-mate"))
 TSV_PATH = CONFIG_DIR / TSV_FILENAME
 
 # ---------------------------------------------------------------------------
@@ -67,6 +67,8 @@ def load_rename_dict() -> list[tuple[str, str]]:
     Skips blank lines and lines whose first non-whitespace character is '#'.
     Raises SystemExit on any structural error.
     """
+    EXPECTED_COLS = 2  # source<TAB>destination
+
     pairs: list[tuple[str, str]] = []
     errors: list[str] = []
 
@@ -80,7 +82,7 @@ def load_rename_dict() -> list[tuple[str, str]]:
         if not line or line.startswith("#"):
             continue
         cols = line.split("\t")
-        if len(cols) < 2:
+        if len(cols) < EXPECTED_COLS:
             errors.append(f"  Line {lineno}: expected 2 tab-separated columns, got {len(cols)}: {raw!r}")
             continue
         src, dst = cols[0].strip(), cols[1].strip()
@@ -153,48 +155,15 @@ def rename_in_directory(
 
 
 def open_tsv_with_default_app() -> None:
-    """Open the TSV dictionary in the OS default app for text files.
-
-    Uses:
-      macOS   → open
-      Windows → os.startfile
-      Linux   → xdg-open
-    """
+    """Open the TSV dictionary in the OS default app for text files."""
     ensure_tsv_exists()
-    print(f"📋  Opening rename dictionary: {TSV_PATH}")
-
-    try:
-        if sys.platform == "darwin":
-            os.execvp("open", ["open", str(TSV_PATH)])
-        elif sys.platform == "win32":
-            os.startfile(str(TSV_PATH))
-        else:
-            os.execvp("xdg-open", ["xdg-open", str(TSV_PATH)])
-    except FileNotFoundError as exc:
-        sys.exit(f"❌  Could not open TSV file: {exc}")
+    open_in_default_app(TSV_PATH, label="rename dictionary")
 
 
 def open_tsv_in_editor() -> None:
-    """Open the TSV dictionary in the user's preferred terminal editor.
-
-    Editor resolution order:
-      1. $EDITOR environment variable
-      2. $VISUAL environment variable
-      3. nano  (macOS / Linux fallback)
-      4. notepad  (Windows fallback)
-    """
+    """Open the TSV dictionary in the user's preferred editor ($EDITOR/$VISUAL)."""
     ensure_tsv_exists()
-    editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or ("notepad" if sys.platform == "win32" else "nano")
-
-    print(f"📝  Opening {TSV_PATH} with '{editor}'…")
-    try:
-        os.execvp(editor, [editor, str(TSV_PATH)])
-    except FileNotFoundError:
-        sys.exit(
-            f"❌  Editor not found: '{editor}'\n"
-            f"    Set the $EDITOR environment variable to your preferred editor,\n"
-            f"    or use -O to open the TSV with the system default app."
-        )
+    open_in_editor(TSV_PATH, label="rename dictionary")
 
 
 # ---------------------------------------------------------------------------
@@ -278,27 +247,7 @@ def main() -> None:
     pairs = load_rename_dict()
 
     # Resolve target directories
-    if args.directories:
-        directories = []
-        for raw in args.directories:
-            p = Path(raw).resolve()
-            if not p.exists():
-                sys.exit(f"❌  Directory does not exist: {p}")
-            if not p.is_dir():
-                sys.exit(f"❌  Not a directory: {p}")
-            if not args.dry_run and not os.access(p, os.W_OK):
-                sys.exit(f"❌  Directory is not writable: {p}")
-            directories.append(p)
-    else:
-        try:
-            cwd = Path.cwd().resolve()
-        except FileNotFoundError:
-            sys.exit("❌  Current directory does not exist. Please change to a valid directory.")
-        if not cwd.is_dir():
-            sys.exit(f"❌  Current directory does not exist: {cwd}")
-        if not args.dry_run and not os.access(cwd, os.W_OK):
-            sys.exit(f"❌  Current directory is not writable: {cwd}")
-        directories = [cwd]
+    directories = resolve_target_dirs(args.directories, check_writable=not args.dry_run)
 
     mode_label = "[DRY RUN] " if args.dry_run else ""
     print(f"\n🎬  xpandroll {mode_label}— {len(pairs)} pairs from {TSV_PATH.name}\n")

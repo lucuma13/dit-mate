@@ -39,21 +39,21 @@ are given on the command line.
 from __future__ import annotations
 
 import argparse
-import ctypes
 import importlib.metadata
 import json
 import os
 import re
-import shutil
-import subprocess
 import sys
-import tomllib
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pyperclip
-from platformdirs import user_config_dir
+
+from dit_mate._internal import term
+from dit_mate._internal.binaries import invoke, run_capture
+from dit_mate._internal.config import CONFIG_DIR, bundled_data, load_or_seed_toml
+from dit_mate._internal.openers import open_in_default_app, open_in_editor
 
 # -----------------------------------------------------------------------------
 # Version
@@ -70,9 +70,7 @@ except importlib.metadata.PackageNotFoundError:  # pragma: no cover
 
 PRESETS_FILENAME = "mrl_presets.toml"
 DEFAULT_PRESETS = "mrl_default_presets.toml"
-CONFIG_DIR = Path(user_config_dir("dit-mate"))
 PRESETS_PATH = CONFIG_DIR / PRESETS_FILENAME
-BUNDLED_PRESETS = Path(__file__).parent / "data" / DEFAULT_PRESETS
 
 _REQUIRED_KEYS = {
     "known_parents",
@@ -84,6 +82,56 @@ _REQUIRED_KEYS = {
 }
 
 
+def _validate_roll_detection(cfg: dict) -> None:
+    """Validate required keys and field types in the [roll_detection] table.
+
+    Exits with a config-pointed message on the first problem found.
+    """
+    missing = _REQUIRED_KEYS - set(cfg.keys())
+    if missing:
+        sys.exit(
+            f"❌  [roll_detection] in {PRESETS_PATH} is missing required keys:\n"
+            f"    {', '.join(sorted(missing))}\n"
+            f"    Run 'mrl -E' to edit the file and fix the error."
+        )
+    for list_key in ("known_parents", "known_parents_flex", "known_siblings_exact", "known_siblings_contains"):
+        if not isinstance(cfg[list_key], list):
+            sys.exit(
+                f"❌  [roll_detection].{list_key} must be a list of quoted strings.\n"
+                f"    Run 'mrl -E' to edit the file and fix the error."
+            )
+    for str_key in ("known_parents_cam_prefix", "known_parents_cam_suffix"):
+        if not isinstance(cfg[str_key], str):
+            sys.exit(
+                f"❌  [roll_detection].{str_key} must be a quoted string (regex pattern).\n"
+                f"    Run 'mrl -E' to edit the file and fix the error."
+            )
+
+
+def _compile_roll_patterns(cfg: dict) -> tuple[list[re.Pattern], re.Pattern, re.Pattern]:
+    """Compile the regex fields, exiting with a config-pointed error on bad patterns.
+
+    Catching bad patterns here means the error points at the config file
+    rather than crashing later inside the roll-detection logic.
+    """
+    try:
+        flex = [re.compile(pat, re.IGNORECASE) for pat in cfg["known_parents_flex"]]
+    except re.error as exc:
+        sys.exit(
+            f"❌  Bad regex in [roll_detection].known_parents_flex: {exc}\n"
+            f"    Run 'mrl -E' to edit the file and fix the error."
+        )
+    try:
+        prefix = re.compile(cfg["known_parents_cam_prefix"], re.IGNORECASE)
+        suffix = re.compile(cfg["known_parents_cam_suffix"], re.IGNORECASE)
+    except re.error as exc:
+        sys.exit(
+            f"❌  Bad regex in [roll_detection] cam prefix/suffix: {exc}\n"
+            f"    Run 'mrl -E' to edit the file and fix the error."
+        )
+    return flex, prefix, suffix
+
+
 def _load_roll_detection_config() -> dict:
     """Load and validate the [roll_detection] table from mrl_presets.toml.
 
@@ -93,21 +141,7 @@ def _load_roll_detection_config() -> dict:
     customisations (extra camera names, site-specific sibling patterns)
     survive package updates.
     """
-    if not PRESETS_PATH.exists():
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        if not BUNDLED_PRESETS.exists():
-            sys.exit(f"❌  Bundled presets not found: {BUNDLED_PRESETS}\n    Re-installing dit-mate should fix this.")
-        shutil.copy(BUNDLED_PRESETS, PRESETS_PATH)
-
-    try:
-        with Path.open(PRESETS_PATH, "rb") as fh:
-            data = tomllib.load(fh)
-    except tomllib.TOMLDecodeError as exc:
-        sys.exit(
-            f"❌  Could not parse presets config file: {PRESETS_PATH}\n"
-            f"    {exc}\n"
-            f"    Run 'mrl -E' to edit the file and fix the error."
-        )
+    data = load_or_seed_toml(PRESETS_PATH, bundled_data(DEFAULT_PRESETS))
 
     if "roll_detection" not in data:
         sys.exit(
@@ -116,61 +150,16 @@ def _load_roll_detection_config() -> dict:
         )
 
     cfg = data["roll_detection"]
-    missing = _REQUIRED_KEYS - set(cfg.keys())
-    if missing:
-        sys.exit(
-            f"❌  [roll_detection] in {PRESETS_PATH} is missing required keys:\n"
-            f"    {', '.join(sorted(missing))}\n"
-            f"    Run 'mrl -E' to edit the file and fix the error."
-        )
-
-    # Type-check list fields
-    for list_key in (
-        "known_parents",
-        "known_parents_flex",
-        "known_siblings_exact",
-        "known_siblings_contains",
-    ):
-        if not isinstance(cfg[list_key], list):
-            sys.exit(
-                f"❌  [roll_detection].{list_key} must be a list of quoted strings.\n"
-                f"    Run 'mrl -E' to edit the file and fix the error."
-            )
-
-    # Type-check string fields
-    for str_key in ("known_parents_cam_prefix", "known_parents_cam_suffix"):
-        if not isinstance(cfg[str_key], str):
-            sys.exit(
-                f"❌  [roll_detection].{str_key} must be a quoted string (regex pattern).\n"
-                f"    Run 'mrl -E' to edit the file and fix the error."
-            )
-
-    # Compile regex fields — catch bad patterns immediately so the error
-    # message points to the config file rather than crashing inside the
-    # roll-detection logic later on.
-    try:
-        compiled_flex = [re.compile(pat, re.IGNORECASE) for pat in cfg["known_parents_flex"]]
-    except re.error as exc:
-        sys.exit(
-            f"❌  Bad regex in [roll_detection].known_parents_flex: {exc}\n"
-            f"    Run 'mrl -E' to edit the file and fix the error."
-        )
-    try:
-        compiled_cam_prefix = re.compile(cfg["known_parents_cam_prefix"], re.IGNORECASE)
-        compiled_cam_suffix = re.compile(cfg["known_parents_cam_suffix"], re.IGNORECASE)
-    except re.error as exc:
-        sys.exit(
-            f"❌  Bad regex in [roll_detection] cam prefix/suffix: {exc}\n"
-            f"    Run 'mrl -E' to edit the file and fix the error."
-        )
+    _validate_roll_detection(cfg)
+    compiled_flex, compiled_cam_prefix, compiled_cam_suffix = _compile_roll_patterns(cfg)
 
     return {
-        "kp_exact": (s.lower() for s in cfg["known_parents"]),
+        "kp_exact": frozenset(s.lower() for s in cfg["known_parents"]),
         "kp_flex": compiled_flex,
         "kp_cam_prefix": compiled_cam_prefix,
         "kp_cam_suffix": compiled_cam_suffix,
-        "ks_exact": (s.lower() for s in cfg["known_siblings_exact"]),
-        "ks_contains": (s.lower() for s in cfg["known_siblings_contains"]),
+        "ks_exact": frozenset(s.lower() for s in cfg["known_siblings_exact"]),
+        "ks_contains": frozenset(s.lower() for s in cfg["known_siblings_contains"]),
     }
 
 
@@ -183,51 +172,17 @@ _RD = _load_roll_detection_config()
 
 
 def _open_presets_with_default_app() -> None:
-    """Open mrl_presets.toml in the OS default app for .toml files.
-
-    Uses:
-      macOS   → open
-      Windows → os.startfile
-      Linux   → xdg-open
-    """
+    """Open mrl_presets.toml in the OS default app for .toml files."""
     if not PRESETS_PATH.exists():
         sys.exit(f"❌  Presets config file not found: {PRESETS_PATH}")
-
-    print(f"📋  Opening presets config file: {PRESETS_PATH}")
-    try:
-        if sys.platform == "darwin":
-            os.execvp("open", ["open", str(PRESETS_PATH)])
-        elif sys.platform == "win32":
-            os.startfile(str(PRESETS_PATH))  # type: ignore[attr-defined]
-        else:
-            os.execvp("xdg-open", ["xdg-open", str(PRESETS_PATH)])
-    except FileNotFoundError as exc:
-        sys.exit(f"❌  Could not open presets file: {exc}")
+    open_in_default_app(PRESETS_PATH, label="presets config file")
 
 
 def _open_presets_in_editor() -> None:
-    """Open mrl_presets.toml in the user's preferred terminal editor.
-
-    Editor resolution order:
-      1. $EDITOR environment variable
-      2. $VISUAL environment variable
-      3. nano  (macOS / Linux fallback)
-      4. notepad  (Windows fallback)
-    """
+    """Open mrl_presets.toml in the user's preferred editor ($EDITOR/$VISUAL)."""
     if not PRESETS_PATH.exists():
         sys.exit(f"❌  Presets config file not found: {PRESETS_PATH}")
-
-    editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or ("notepad" if sys.platform == "win32" else "nano")
-
-    print(f"📝  Opening {PRESETS_PATH} with '{editor}'…")
-    try:
-        os.execvp(editor, [editor, str(PRESETS_PATH)])
-    except FileNotFoundError:
-        sys.exit(
-            f"❌  Editor not found: '{editor}'\n"
-            f"    Set the $EDITOR environment variable to your preferred editor,\n"
-            f"    or use -O to open mrl_presets.toml with the system default app."
-        )
+    open_in_editor(PRESETS_PATH, label="presets config file")
 
 
 # ---------------------------------------------------------------------------
@@ -311,38 +266,15 @@ def _session_signature(name: str) -> tuple[str, ...]:
 # Terminal colors (TTY only — disabled when piping to a file)
 # ---------------------------------------------------------------------------
 
-
-def _enable_ansi_on_windows() -> bool:
-    """Enable ANSI escape processing on Windows 10+ consoles. No-op on Unix.
-
-    Returns:
-        ``True`` if ANSI is usable (Unix always, Windows when the
-        SetConsoleMode call succeeds). The caller pairs this with
-        ``sys.stdout.isatty()`` to decide whether to emit color codes.
-    """
-    if os.name != "nt":
-        return True
-    try:
-        kernel32 = ctypes.windll.kernel32
-        h = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
-        mode = ctypes.c_ulong()
-        if not kernel32.GetConsoleMode(h, ctypes.byref(mode)):
-            return False
-        # ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
-        kernel32.SetConsoleMode(h, mode.value | 0x0004)
-        return True
-    except Exception:
-        return False
-
-
-_ANSI_OK = sys.stdout.isatty() and _enable_ansi_on_windows()
-_ANSI_ERR = sys.stderr.isatty() and _enable_ansi_on_windows()
-DIM = "\033[38;5;246m" if _ANSI_OK else ""
-RESET = "\033[0m" if _ANSI_OK else ""
-# Header is printed to stderr, so it needs its own ANSI guards.
-DIM_ERR = "\033[38;5;246m" if _ANSI_ERR else ""
-UNDERLINE_ERR = "\033[4m" if _ANSI_ERR else ""
-RESET_ERR = "\033[0m" if _ANSI_ERR else ""
+# Codes come from the shared palette so every tool renders the same hues.
+# stdout and stderr are gated independently (the header prints to stderr).
+_COLOR = term.supports_color(sys.stdout)
+_COLOR_ERR = term.supports_color(sys.stderr)
+DIM = term.DIM if _COLOR else ""
+RESET = term.RESET if _COLOR else ""
+DIM_ERR = term.DIM if _COLOR_ERR else ""
+UNDERLINE_ERR = term.UNDERLINE if _COLOR_ERR else ""
+RESET_ERR = term.RESET if _COLOR_ERR else ""
 
 # Windows Explorer reports sizes in GiB (1 GiB = 2^30 bytes) while
 # macOS Finder and Linux tools report in decimal GB (1 GB = 10^9 bytes).
@@ -351,43 +283,6 @@ RESET_ERR = "\033[0m" if _ANSI_ERR else ""
 _SIZE_IS_GIB = os.name == "nt"
 _SIZE_DIVISOR = 1_073_741_824 if _SIZE_IS_GIB else 1_000_000_000
 _SIZE_UNIT = "GiB" if _SIZE_IS_GIB else "GB"
-
-
-# ---------------------------------------------------------------------------
-# Subprocess helpers
-# ---------------------------------------------------------------------------
-
-# On Windows, suppress child console windows for media tools.
-_POPEN_KW: dict = {}
-if os.name == "nt":
-    _POPEN_KW["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
-
-
-def _run(cmd: list[str]) -> str:
-    """Run a command and return stdout. Empty string on any failure.
-
-    Used to invoke ``ffprobe`` from a single batched
-    call per roll. We intentionally swallow all errors (missing binary,
-    non-zero exit, OS error) and return an empty string so callers can
-    treat "no data" and "tool not installed" identically — both result
-    in the corresponding field being skipped or set to a fallback value
-    rather than the whole script crashing.
-
-    The Windows ``CREATE_NO_WINDOW`` flag in ``_POPEN_KW`` keeps a
-    background console window from briefly flashing when running mrl
-    from a non-console environment (e.g. a launcher).
-    """
-    try:
-        r = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            check=False,
-            **_POPEN_KW,
-        )
-        return r.stdout
-    except (FileNotFoundError, OSError, subprocess.SubprocessError):
-        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -477,11 +372,8 @@ def _is_rdc_dir(p: Path) -> bool:
 
 def _r3d_files_in_rdc(rdc: Path) -> list[Path]:
     """Return the sequential R3D chunks inside an RDC, sorted by name."""
-    chunks: list[Path] = []
     try:
-        for f in rdc.iterdir():
-            if f.is_file() and f.suffix.lower() == R3D_FILE_EXT:
-                chunks.append(f)
+        chunks = [f for f in rdc.iterdir() if f.is_file() and f.suffix.lower() == R3D_FILE_EXT]
     except OSError:
         return []
     chunks.sort(key=lambda p: p.name)
@@ -495,20 +387,70 @@ def _video_files_in_rdc(rdc: Path) -> list[Path]:
     into the RDC directory structure instead of R3D. In that case the
     RDC contains .mov/.mp4/.mxf files rather than .R3D chunks.
     """
-    files: list[Path] = []
     try:
-        for f in rdc.iterdir():
-            if f.is_file() and f.suffix.lower() in VIDEO_EXTS:
-                files.append(f)
+        files = [f for f in rdc.iterdir() if f.is_file() and f.suffix.lower() in VIDEO_EXTS]
     except OSError:
         return []
     files.sort(key=lambda p: p.name)
     return files
 
 
+def _rdc_to_clip_or_issue(rdc: Path) -> Clip | Issue:
+    """Build a single video Clip from an ``.RDC`` directory, or an Issue if empty.
+
+    Looks for R3D chunks first, then ProRes/H.265 recorded directly into
+    the RDC (RED Komodo / DSMC3 non-RAW modes).
+    """
+    chunks = _r3d_files_in_rdc(rdc) or _video_files_in_rdc(rdc)
+    if not chunks:
+        return Issue(anchor=rdc, message=f"empty RDC directory (no media files inside): {rdc}")
+    # rdc.stem strips the .RDC suffix for the rushes-log clip name.
+    return Clip(name=rdc.stem, files=tuple(chunks), anchor=rdc, kind="video")
+
+
 def _should_skip(name: str) -> bool:
     """macOS litter that pollutes cross-platform card copies."""
     return name == ".DS_Store" or name.startswith("._")
+
+
+def _scan_dir_files(d: Path, filenames: list[str]) -> tuple[list[Clip], list[Issue]]:
+    """Classify the plain files at one directory level into clips and issues.
+
+    Videos are gathered into a per-directory batch first because GoPro
+    chaptering can merge multiple files into one Clip (like RDC dirs merge
+    R3D chunks); the batch is handed to ``_build_video_clips_in_dir`` which
+    knows that rule. Audio files are simpler — one Clip per file. Stray
+    .R3D / RED sidecars (RDC dirs were already pruned by the caller) and are
+    reported as issues.
+    """
+    clips: list[Clip] = []
+    issues: list[Issue] = []
+    dir_videos: list[Path] = []
+    for fn in filenames:
+        if _should_skip(fn):
+            continue
+        f = d / fn
+        ext = f.suffix.lower()
+        if ext == INSV_LRV_EXT:
+            # Insta360 camera-generated low-resolution proxy. Silently
+            # skip — it is a sidecar to the matching .insv clip and should
+            # not be counted as a separate clip or flagged as unexpected.
+            continue
+        if ext in VIDEO_EXTS:
+            dir_videos.append(f)
+        elif ext in AUDIO_EXTS:
+            clips.append(Clip(name=f.stem, files=(f,), anchor=f, kind="audio"))
+        elif ext == R3D_FILE_EXT:
+            # RDC dirs were pruned before the file loop, so any .R3D here
+            # is in a non-RDC parent — definitively stray.
+            issues.append(Issue(anchor=f, message=f"stray .R3D file outside any .RDC directory: {f}"))
+        elif ext in RED_SIDECAR_EXTS:
+            # Same reasoning — RED color sidecars belong inside an RDC.
+            issues.append(Issue(anchor=f, message=f"stray RED sidecar ({ext}) outside any .RDC directory: {f}"))
+
+    if dir_videos:
+        clips.extend(_build_video_clips_in_dir(dir_videos))
+    return clips, issues
 
 
 def _parse_gopro_chapter(stem: str) -> tuple[str, str, int, int] | None:
@@ -568,7 +510,7 @@ def _build_video_clips_in_dir(video_files: list[Path]) -> list[Clip]:
     clips: list[Clip] = []
 
     # Each take of GoPro chaptered video becomes one clip.
-    for xxxx, chunks in gopro_takes.items():
+    for chunks in gopro_takes.values():
         # Sort chunks by chapter number so the lowest-chapter chunk is
         # first and supplies the canonical clip name. We re-parse here
         # rather than threading the parse through; it's cheap and keeps
@@ -590,15 +532,7 @@ def _build_video_clips_in_dir(video_files: list[Path]) -> list[Clip]:
         )
 
     # Regular (non-chaptered) videos: one Clip per file.
-    for f in regular:
-        clips.append(
-            Clip(
-                name=f.stem,
-                files=(f,),
-                anchor=f,
-                kind="video",
-            )
-        )
+    clips.extend(Clip(name=f.stem, files=(f,), anchor=f, kind="video") for f in regular)
 
     return clips
 
@@ -626,26 +560,11 @@ def find_clips(root: Path) -> tuple[list[Clip], list[Issue]]:
     # Edge case: user pointed mrl directly at an RDC. Treat the whole
     # thing as a single clip (or raise an issue if it's empty) and stop.
     if _is_rdc_dir(root):
-        chunks = _r3d_files_in_rdc(root)
-        if not chunks:
-            # No R3D — check for ProRes/H.265 recorded directly into the RDC.
-            chunks = _video_files_in_rdc(root)
-        if chunks:
-            clips.append(
-                Clip(
-                    name=root.stem,  # strips .RDC
-                    files=tuple(chunks),
-                    anchor=root,
-                    kind="video",
-                )
-            )
+        item = _rdc_to_clip_or_issue(root)
+        if isinstance(item, Clip):
+            clips.append(item)
         else:
-            issues.append(
-                Issue(
-                    anchor=root,
-                    message=f"empty RDC directory (no media files inside): {root}",
-                )
-            )
+            issues.append(item)
         return clips, issues
 
     # Sony XDCAM sub-stream directory names that contain proxy/sub-stream
@@ -669,84 +588,18 @@ def find_clips(root: Path) -> tuple[list[Clip], list[Issue]]:
         # os.walk's documented contract.
         rdc_names = [n for n in dirnames if n.lower().endswith(RDC_DIR_EXT)]
         for n in rdc_names:
-            rdc = d / n
-            chunks = _r3d_files_in_rdc(rdc)
-            if not chunks:
-                # No R3D — check for ProRes/H.265 recorded directly into the RDC
-                # (RED Komodo, DSMC3 in non-RAW modes).
-                chunks = _video_files_in_rdc(rdc)
-            if not chunks:
-                # Genuinely empty RDC — clip data missing.
-                issues.append(
-                    Issue(
-                        anchor=rdc,
-                        message=f"empty RDC directory (no media files inside): {rdc}",
-                    )
-                )
-                continue
-            # Strip the .RDC suffix for the rushes-log clip name.
-            name_no_ext = n[: -len(RDC_DIR_EXT)] if len(n) > len(RDC_DIR_EXT) else n
-            clips.append(
-                Clip(
-                    name=name_no_ext,
-                    files=tuple(chunks),
-                    anchor=rdc,
-                    kind="video",
-                )
-            )
+            item = _rdc_to_clip_or_issue(d / n)
+            if isinstance(item, Clip):
+                clips.append(item)
+            else:
+                issues.append(item)
         # Prevent os.walk from descending into the RDCs we just consumed.
         dirnames[:] = [n for n in dirnames if not n.lower().endswith(RDC_DIR_EXT)]
 
-        # Now handle plain files at this level. Videos are gathered
-        # into a per-directory list first because GoPro chaptering can
-        # merge multiple files into one Clip (similar to how RDC
-        # directories merge multiple R3D files); we hand the batch to
-        # _build_video_clips_in_dir which knows that rule. Audio files
-        # are simpler — one Clip per file.
-        dir_videos: list[Path] = []
-        for fn in filenames:
-            if _should_skip(fn):
-                continue
-            f = d / fn
-            ext = f.suffix.lower()
-            if ext == INSV_LRV_EXT:
-                # Insta360 camera-generated low-resolution proxy. Silently
-                # skip — it is a sidecar to the matching .insv clip and
-                # should not be counted as a separate clip or flagged as
-                # an unexpected file.
-                continue
-            if ext in VIDEO_EXTS:
-                dir_videos.append(f)
-            elif ext in AUDIO_EXTS:
-                clips.append(
-                    Clip(
-                        name=f.stem,
-                        files=(f,),
-                        anchor=f,
-                        kind="audio",
-                    )
-                )
-            elif ext == R3D_FILE_EXT:
-                # We pruned RDC dirs from `dirnames` before reaching the
-                # file loop, so any .R3D we see here is in a non-RDC
-                # parent — definitively stray.
-                issues.append(
-                    Issue(
-                        anchor=f,
-                        message=f"stray .R3D file outside any .RDC directory: {f}",
-                    )
-                )
-            elif ext in RED_SIDECAR_EXTS:
-                # Same reasoning — RED color sidecars belong inside an RDC.
-                issues.append(
-                    Issue(
-                        anchor=f,
-                        message=f"stray RED sidecar ({ext}) outside any .RDC directory: {f}",
-                    )
-                )
-
-        if dir_videos:
-            clips.extend(_build_video_clips_in_dir(dir_videos))
+        # Now handle plain files at this level.
+        dir_clips, dir_issues = _scan_dir_files(d, filenames)
+        clips.extend(dir_clips)
+        issues.extend(dir_issues)
 
     # Stable sort by anchor path so caller gets predictable order.
     clips.sort(key=lambda c: str(c.anchor))
@@ -803,6 +656,49 @@ def _has_media(directory: Path) -> bool:
     return False
 
 
+def _split_known_parents(d: Path) -> tuple[list[Path], list[Path]] | None:
+    """Split ``d``'s immediate subdirs into (known-parents, non-known-parents).
+
+    Subdirs are sorted by name and known siblings are excluded entirely.
+    Returns ``None`` if ``d`` can't be read (the caller decides how to
+    treat an unreadable directory).
+    """
+    try:
+        subdirs = sorted(
+            (s for s in d.iterdir() if s.is_dir() and not _is_known_sibling(s.name)),
+            key=lambda s: s.name,
+        )
+    except OSError:
+        return None
+    kp = [s for s in subdirs if _is_known_parent(s.name)]
+    non_kp = [s for s in subdirs if not _is_known_parent(s.name)]
+    return kp, non_kp
+
+
+def _misplaced_roll_warnings(
+    siblings: list[Path],
+    kp_name: str,
+    parent_name: str,
+) -> list[tuple[Path, list[str]]]:
+    """Build ``(dir, [warning])`` entries for non-known-parent siblings.
+
+    A non-KP directory sitting alongside a known parent is a likely
+    misplaced roll, but only flagged when it actually contains media —
+    empty siblings are ignored silently.
+    """
+    out: list[tuple[Path, list[str]]] = []
+    for sib in siblings:
+        if not _has_media(sib):
+            continue
+        warn = (
+            f"⚠️  '{sib.name}' found alongside known-parent "
+            f"'{kp_name}' under '{parent_name}' — "
+            f"possible misplaced roll. Including in output."
+        )
+        out.append((sib, [warn]))
+    return out
+
+
 def _find_roll_dirs(root: Path) -> list[tuple[Path, list[str]]]:
     """Return ``[(roll_dir, warnings), ...]`` for rolls under ``root``.
 
@@ -818,16 +714,10 @@ def _find_roll_dirs(root: Path) -> list[tuple[Path, list[str]]]:
       5. Non-KP siblings of KP1 at root level are included as rolls
          with a warning (likely misplaced alongside a KP sibling).
     """
-    try:
-        subdirs = sorted(
-            [d for d in root.iterdir() if d.is_dir() and not _is_known_sibling(d.name)],
-            key=lambda d: d.name,
-        )
-    except OSError:
+    split = _split_known_parents(root)
+    if split is None:
         return [(root, [])]
-
-    kp1 = [d for d in subdirs if _is_known_parent(d.name)]
-    non_kp1 = [d for d in subdirs if not _is_known_parent(d.name)]
+    kp1, non_kp1 = split
 
     if not kp1:
         if _is_known_parent(root.name):
@@ -838,59 +728,30 @@ def _find_roll_dirs(root: Path) -> list[tuple[Path, list[str]]]:
         return [(root, [])]
 
     results: list[tuple[Path, list[str]]] = []
-
-    # Non-KP siblings of KP1 at root level are likely misplaced rolls,
-    # but only if they actually contain media — otherwise ignore silently.
-    for sib in non_kp1:
-        if not _has_media(sib):
-            continue
-        warn = (
-            f"⚠️  '{sib.name}' found alongside known-parent "
-            f"'{kp1[0].name}' under '{root.name}' — "
-            f"possible misplaced roll. Including in output."
-        )
-        results.append((sib, [warn]))
+    results.extend(_misplaced_roll_warnings(non_kp1, kp1[0].name, root.name))
 
     for parent in kp1:
-        try:
-            children = sorted(
-                [d for d in parent.iterdir() if d.is_dir() and not _is_known_sibling(d.name)],
-                key=lambda d: d.name,
-            )
-        except OSError:
+        child_split = _split_known_parents(parent)
+        if child_split is None:
+            continue
+        kp2, non_kp2 = child_split
+
+        if not kp2:
+            # No KP2 → direct non-KP children are rolls.
+            results.extend((roll_dir, []) for roll_dir in non_kp2)
             continue
 
-        kp2 = [d for d in children if _is_known_parent(d.name)]
-        non_kp2 = [d for d in children if not _is_known_parent(d.name)]
-
-        if kp2:
-            # Level-2 known parents — rolls live under them.
-            for kp in kp2:
-                try:
-                    roll_children = sorted(
-                        [d for d in kp.iterdir() if d.is_dir()],
-                        key=lambda d: d.name,
-                    )
-                except OSError:
-                    continue
-                for roll_dir in roll_children:
-                    results.append((roll_dir, []))
-
-            # Non-KP2 siblings alongside KP2 dirs are likely misplaced,
-            # but only if they actually contain media — otherwise ignore.
-            for sib in non_kp2:
-                if not _has_media(sib):
-                    continue
-                warn = (
-                    f"⚠️  '{sib.name}' found alongside known-parent "
-                    f"'{kp2[0].name}' under '{parent.name}' — "
-                    f"possible misplaced roll. Including in output."
+        # Level-2 known parents — rolls live under them.
+        for kp in kp2:
+            try:
+                roll_children = sorted(
+                    (d for d in kp.iterdir() if d.is_dir()),
+                    key=lambda d: d.name,
                 )
-                results.append((sib, [warn]))
-        else:
-            # No KP2 → direct non-KP children are rolls.
-            for roll_dir in non_kp2:
-                results.append((roll_dir, []))
+            except OSError:
+                continue
+            results.extend((roll_dir, []) for roll_dir in roll_children)
+        results.extend(_misplaced_roll_warnings(non_kp2, kp2[0].name, parent.name))
 
     return results or [(root, [])]
 
@@ -984,7 +845,7 @@ def validate_roll(clips: list[Clip]) -> list[Issue]:
         # Build a human-readable summary using one example clip name
         # per signature group, plus the count.
         summary_parts = []
-        for sig, group in sorted(
+        for _sig, group in sorted(
             by_signature.items(),
             key=lambda kv: (-len(kv[1]), kv[0]),  # largest group first
         ):
@@ -1070,7 +931,7 @@ def audio_creation_times(wavs: list[Path]) -> dict[Path, str]:
     # so we call it once per file.
     result: dict[Path, str] = {}
     for p in wavs:
-        raw = _run([*args, str(p)])
+        raw = run_capture([*args, str(p)])
         ts = ""
         if raw.strip():
             try:
@@ -1253,7 +1114,7 @@ def total_duration_seconds(clips: list[Clip]) -> float:
 
     total = 0.0
     for f in video_files:
-        raw = _run(
+        raw = run_capture(
             [
                 "ffprobe",
                 "-v",
@@ -1299,14 +1160,13 @@ def render_roll(clips: list[Clip], fields: list[str], roll_root: Path | None = N
     ``roll_root`` is the directory to walk for size (matches Finder/Explorer).
     """
     # Compute lazily — only what's needed.
-    _first: str | None = None
-    _last: str | None = None
+    _first_last: tuple[str, str] | None = None
 
     def get_first_last() -> tuple[str, str]:
-        nonlocal _first, _last
-        if _first is None:
-            _first, _last = first_last_clips(clips)
-        return _first, _last
+        nonlocal _first_last
+        if _first_last is None:
+            _first_last = first_last_clips(clips)
+        return _first_last
 
     _duration: float | None = None
     _any_video: bool | None = None
@@ -1318,24 +1178,325 @@ def render_roll(clips: list[Clip], fields: list[str], roll_root: Path | None = N
             _any_video = any(c.kind == "video" for c in clips)
         return format_hms(_duration) if _any_video else ""
 
-    out: list[str] = []
-    for field in fields:
-        if field == "first":
-            out.append(get_first_last()[0])
-        elif field == "last":
-            out.append(get_first_last()[1])
-        elif field == "n":
-            out.append(str(len(clips)))
-        elif field == "duration":
-            out.append(get_duration())
-        elif field == "size":
-            out.append(f"{total_size_gb(clips, roll_root):.2f}")
-    return "\t".join(out)
+    # Thunk dispatch: each field maps to a zero-arg producer so only the
+    # requested columns are computed (first/last share get_first_last).
+    emitters = {
+        "first": lambda: get_first_last()[0],
+        "last": lambda: get_first_last()[1],
+        "n": lambda: str(len(clips)),
+        "duration": get_duration,
+        "size": lambda: f"{total_size_gb(clips, roll_root):.2f}",
+    }
+    return "\t".join(emitters[f]() for f in fields if f in emitters)
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+
+_FLAG_TO_FIELD = {
+    "-f": "first",
+    "--first-clip": "first",
+    "-l": "last",
+    "--last-clip": "last",
+    "-s": "size",
+    "--size": "size",
+    "-d": "duration",
+    "--duration": "duration",
+    "-c": "n",
+    "--clip-count": "n",
+    "-r": "roll",
+    "--roll": "roll",
+}
+_FIELD_TO_HEADER = {
+    "first": "FIRST CLIP",
+    "last": "LAST CLIP",
+    "n": "CLIP COUNT",
+    "duration": "DURATION",
+    "size": f"SIZE ({_SIZE_UNIT})",
+    "roll": "ROLL",
+}
+# Default field order when no field flags are given.
+_DEFAULT_FIELDS = ["roll", "first", "last", "n", "duration", "size"]
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    """Construct the argument parser for the mrl CLI."""
+    parser = argparse.ArgumentParser(
+        prog="mrl",
+        description=(
+            "Master Rushes Log helper: scan a camera roll directory and "
+            "emit values for the log (first clip, last clip, size, "
+            "duration, clip count, roll name). With no flags, all fields "
+            "are emitted in default order. Multiple rolls under the input "
+            "path (or multiple input paths) produce one line per roll. "
+            "Short flags can be combined POSIX-style: -flsdc is the same "
+            "as -f -l -s -d -c. Column order follows the order flags are given."
+        ),
+    )
+    parser.add_argument("-f", "-F", "--first-clip", action="store_true", help="print first clip name")
+    parser.add_argument("-l", "-L", "--last-clip", action="store_true", help="print last clip name.")
+    parser.add_argument("-s", "-S", "--size", action="store_true", help=f"print total size in {_SIZE_UNIT}")
+    parser.add_argument(
+        "-d", "-D", "--duration", action="store_true", help="print aggregated duration of video clips (HH:MM:SS)"
+    )
+    parser.add_argument("-c", "-C", "--clip-count", action="store_true", help="print the clip count")
+    parser.add_argument("-r", "-R", "--roll", action="store_true", help="print the roll name")
+    parser.add_argument(
+        "-E",
+        "--edit-presets",
+        action="store_true",
+        dest="edit_presets",
+        help="edit mrl_presets.toml in your default terminal editor ($EDITOR)",
+    )
+    parser.add_argument(
+        "-O",
+        "--open-presets",
+        action="store_true",
+        dest="open_presets",
+        help="open mrl_presets.toml in the system default app for text files",
+    )
+    parser.add_argument("--version", action="version", version=f"{__version__}")
+    parser.add_argument(
+        "paths",
+        nargs="*",
+        default=["."],
+        help="camera roll directories (default: current directory)",
+    )
+    return parser
+
+
+def _parse_fields(raw_argv: list[str]) -> list[str]:
+    """Build the ordered field list from the argv token sequence.
+
+    Preserves the order flags were typed (this drives both render and
+    header) and expands combined POSIX short flags like ``-flsdc`` into
+    individual flags. Falls back to the default order when no field flags
+    were given.
+    """
+    SINGLE_SHORT_FLAG_LEN = 2  # len("-x"); anything longer is a combined bundle
+
+    fields: list[str] = []
+    seen: set[str] = set()
+    for token in raw_argv:
+        # Expand combined short flags like -flsdc into -f -l -s -d -c.
+        if token.startswith("-") and not token.startswith("--") and len(token) > SINGLE_SHORT_FLAG_LEN:
+            tokens = [f"-{ch}" for ch in token[1:]]
+        else:
+            tokens = [token]
+        for t in tokens:
+            f = _FLAG_TO_FIELD.get(t)
+            if f and f not in seen:
+                fields.append(f)
+                seen.add(f)
+    return fields or _DEFAULT_FIELDS[:]
+
+
+def _collect_rolls(args: argparse.Namespace) -> list[tuple[str, Path, list[Clip], list[Issue]]] | None:
+    """Discover rolls for the input path(s), validating each roll's contents.
+
+    Multi-path mode treats each argument as a named roll directly (trusting
+    the user's grouping). Single-path mode uses ``_find_roll_dirs`` to locate
+    rolls via known-parent detection. Returns the collected rolls, or ``None``
+    if an input path is not a directory (the error is already printed).
+    """
+    rolls: list[tuple[str, Path, list[Clip], list[Issue]]] = []
+    if len(args.paths) > 1:
+        # Multi-path mode: each argument is a named roll directly — no
+        # grouping algorithm, insertion order preserved. We trust the names
+        # but still validate contents for mixed-session or other issues.
+        for raw_path in args.paths:
+            target = Path(raw_path).resolve()
+            if not target.is_dir():
+                print(f"Error: '{target}' is not a directory.", file=sys.stderr)
+                return None
+            clips, issues = find_clips(target)
+            roll_issues = list(issues) + validate_roll(clips)
+            rolls.append((target.name, target, clips, roll_issues))
+        return rolls
+
+    # Single-path mode (or bare invocation defaulting to "."):
+    # use _find_roll_dirs to locate rolls via known-parent detection.
+    target = Path(args.paths[0]).resolve()
+    if not target.is_dir():
+        print(f"Error: '{target}' is not a directory.", file=sys.stderr)
+        return None
+    for roll_dir, dir_warnings in _find_roll_dirs(target):
+        for w in dir_warnings:
+            print(w, file=sys.stderr)
+        clips, issues = find_clips(roll_dir)
+        if not clips and not issues:
+            continue
+        roll_issues = list(issues) + validate_roll(clips)
+        rolls.append((roll_dir.name, roll_dir, clips, roll_issues))
+    return rolls
+
+
+def _report_broken_rolls(rolls: list[tuple[str, Path, list[Clip], list[Issue]]]) -> bool:
+    """Print stderr diagnostics for every roll with issues.
+
+    Done before stdout so the user sees warnings first when stderr and
+    stdout share a terminal. Returns True if any roll had issues.
+    """
+    had_issues = False
+    for name, _root, _clips, issues in rolls:
+        if not issues:
+            continue
+        had_issues = True
+        for issue in issues:
+            print(f"Warning: roll '{name}' — {issue.message}", file=sys.stderr)
+        print(
+            f"Warning: roll '{name}' has issues that need investigation; "
+            f"skipping output for this roll. Please check it manually.",
+            file=sys.stderr,
+        )
+    return had_issues
+
+
+def _fmt_header(label: str) -> str:
+    """Dim the label with its first character underlined as a flag hint."""
+    if not label:
+        return ""
+    return f"{DIM_ERR}{UNDERLINE_ERR}{label[0]}{RESET_ERR}{DIM_ERR}{label[1:]}{RESET_ERR}"
+
+
+def _format_header_line(header_labels: list[str], col_widths: list[int]) -> str:
+    """Build the dimmed, column-aligned header row (printed to stderr)."""
+    padded = [h.ljust(col_widths[i]) if i < len(col_widths) - 1 else h for i, h in enumerate(header_labels)]
+    return "\t".join(_fmt_header(h) for h in padded)
+
+
+def _raw_row(
+    name: str,
+    roll_root: Path,
+    clips: list[Clip],
+    fields: list[str],
+    data_fields: list[str],
+) -> list[str]:
+    """Return ordered cell values (strings) for one roll."""
+    data_line = render_roll(clips, data_fields, roll_root)
+    data_vals = data_line.split("\t") if data_line else []
+    di = 0
+    cells: list[str] = []
+    for f in fields:
+        if f == "roll":
+            cells.append(name)
+        else:
+            cells.append(data_vals[di] if di < len(data_vals) else "")
+            di += 1
+    return cells
+
+
+def _pad_row(cells: list[str], widths: list[int], *, pad_last: bool = False) -> str:
+    """Space-pad each cell to its column width, join with a single tab.
+
+    The last cell is only padded when ``pad_last=True`` — i.e. when a
+    courtesy roll label follows and needs to land in an aligned column.
+    ``cells`` and ``widths`` must be the same length; a mismatch is a bug
+    but we handle it gracefully rather than crashing.
+    """
+    n = len(widths)
+    padded = []
+    for i, cell in enumerate(cells):
+        if i < n - 1 or pad_last:
+            padded.append(cell.ljust(widths[i] if i < n else 0))
+        else:
+            padded.append(cell)
+    return "\t".join(padded)
+
+
+def _clipboard_tsv(rows: list[tuple[str, list[str]]]) -> str:
+    """Build strict TSV for clipboard: no padding, no header.
+
+    Cells come from ``_raw_row`` which only includes requested fields —
+    roll is present iff ``-r`` was given. No courtesy labels, no trailing
+    spaces, one row per line.
+    """
+    return "\n".join("\t".join(cells) for _name, cells in rows)
+
+
+def _copy_to_clipboard(text: str) -> None:
+    """Copy ``text`` to the system clipboard. Silent no-op on failure.
+
+    Tries pyperclip first (handles macOS, Windows, Linux X11/Wayland,
+    WSL). Falls back to direct subprocess calls (pbcopy / clip / xclip)
+    if pyperclip is not installed.
+    """
+    try:
+        pyperclip.copy(text)
+        return
+    except pyperclip.PyperclipException:
+        pass
+    # Stdlib fallback.
+    try:
+        if sys.platform == "darwin":
+            invoke(["pbcopy"], input=text, text=True)
+        elif sys.platform == "win32":
+            invoke(["clip"], input=text, text=True)
+        else:
+            for cmd in (
+                ["xclip", "-selection", "clipboard"],
+                ["xsel", "--clipboard", "--input"],
+            ):
+                if invoke(cmd, input=text, text=True).returncode == 0:
+                    break
+    except OSError:
+        pass  # Clipboard is best-effort; never crash the script.
+
+
+def _render_rolls(
+    valid_rolls: list[tuple[str, Path, list[Clip]]],
+    fields: list[str],
+    *,
+    multi: bool,
+    had_issues: bool,
+) -> int:
+    """Render surviving rolls: values to stdout, aligned header to stderr.
+
+    Copies the strict (unpadded) TSV to the clipboard. The table layout
+    (header + one row per roll) is used whenever more than one roll was
+    found; a lone roll gets the compact single-roll layout. Returns the
+    process exit code: 1 if any roll had issues, else 0.
+    """
+    want_roll = "roll" in fields
+    data_fields = [f for f in fields if f != "roll"]
+    header_labels = [_FIELD_TO_HEADER[f] for f in fields]
+
+    all_rows: list[tuple[str, list[str]]] = [
+        (name, _raw_row(name, root, clips, fields, data_fields)) for name, root, clips in valid_rolls
+    ]
+
+    # Column widths: max of header label length and any data cell in that column.
+    col_widths = [len(h) for h in header_labels]
+    for _name, cells in all_rows:
+        for i, cell in enumerate(cells):
+            if i < len(col_widths):
+                col_widths[i] = max(col_widths[i], len(cell))
+
+    if multi:
+        # Header to stderr — purely visual, never captured by pipes.
+        print(_format_header_line(header_labels, col_widths), file=sys.stderr)
+        for name, cells in all_rows:
+            if want_roll:
+                print(_pad_row(cells, col_widths))
+            else:
+                # Courtesy roll label as a trailing dimmed column, excluded
+                # from clipboard TSV since it's not in cells.
+                row = _pad_row(cells, col_widths, pad_last=True)
+                print(f"{row}\t{DIM}({name}){RESET}")
+        _copy_to_clipboard(_clipboard_tsv(all_rows))
+        return 1 if had_issues else 0
+
+    # Single valid roll.
+    _name, cells = all_rows[0]
+    if len(fields) > 1:
+        print(_format_header_line(header_labels, col_widths), file=sys.stderr)
+    else:
+        print(_fmt_header(header_labels[0]), file=sys.stderr)
+    print(_pad_row(cells, col_widths))
+    _copy_to_clipboard(_clipboard_tsv(all_rows))
+    return 1 if had_issues else 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1363,86 +1524,7 @@ def main(argv: list[str] | None = None) -> int:
         (whether or not other rolls produced output) or if no media
         was found at all.
     """
-    parser = argparse.ArgumentParser(
-        prog="mrl",
-        description=(
-            "Master Rushes Log helper: scan a camera roll directory and "
-            "emit values for the log (first clip, last clip, size, "
-            "duration, clip count, roll name). With no flags, all fields "
-            "are emitted in default order. Multiple rolls under the input "
-            "path (or multiple input paths) produce one line per roll. "
-            "Short flags can be combined POSIX-style: -flsdc is the same "
-            "as -f -l -s -d -c. Column order follows the order flags are given."
-        ),
-    )
-    parser.add_argument(
-        "-f",
-        "-F",
-        "--first-clip",
-        action="store_true",
-        help="print first clip name",
-    )
-    parser.add_argument(
-        "-l",
-        "-L",
-        "--last-clip",
-        action="store_true",
-        help="print last clip name.",
-    )
-    parser.add_argument(
-        "-s",
-        "-S",
-        "--size",
-        action="store_true",
-        help=f"print total size in {_SIZE_UNIT}",
-    )
-    parser.add_argument(
-        "-d",
-        "-D",
-        "--duration",
-        action="store_true",
-        help="print aggregated duration of video clips (HH:MM:SS)",
-    )
-    parser.add_argument(
-        "-c",
-        "-C",
-        "--clip-count",
-        action="store_true",
-        help="print the clip count",
-    )
-    parser.add_argument(
-        "-r",
-        "-R",
-        "--roll",
-        action="store_true",
-        help="print the roll name",
-    )
-    parser.add_argument(
-        "-E",
-        "--edit-presets",
-        action="store_true",
-        dest="edit_presets",
-        help="edit mrl_presets.toml in your default terminal editor ($EDITOR)",
-    )
-    parser.add_argument(
-        "-O",
-        "--open-presets",
-        action="store_true",
-        dest="open_presets",
-        help="open mrl_presets.toml in the system default app for text files",
-    )
-    parser.add_argument(
-        "--version",
-        action="version",
-        version=f"{__version__}",
-    )
-    parser.add_argument(
-        "paths",
-        nargs="*",
-        default=["."],
-        help="camera roll directories (default: current directory)",
-    )
-    args = parser.parse_args(argv)
+    args = _build_parser().parse_args(argv)
 
     # Open / edit presets and exit — these flags short-circuit everything else.
     if args.open_presets:
@@ -1454,249 +1536,28 @@ def main(argv: list[str] | None = None) -> int:
         _open_presets_in_editor()
         return 0
 
-    # Build the ordered fields list from the argv token sequence.
-    # This drives both render_roll and the header, preserving the exact
-    # order the user typed their flags.
-    _flag_to_field = {
-        "-f": "first",
-        "--first-clip": "first",
-        "-l": "last",
-        "--last-clip": "last",
-        "-s": "size",
-        "--size": "size",
-        "-d": "duration",
-        "--duration": "duration",
-        "-c": "n",
-        "--clip-count": "n",
-        "-r": "roll",
-        "--roll": "roll",
-    }
-    _field_to_header = {
-        "first": "FIRST CLIP",
-        "last": "LAST CLIP",
-        "n": "CLIP COUNT",
-        "duration": "DURATION",
-        "size": f"SIZE ({_SIZE_UNIT})",
-        "roll": "ROLL",
-    }
-    # Default order when no flags given
-    _default_fields = ["roll", "first", "last", "n", "duration", "size"]
-
     raw_argv = argv if argv is not None else sys.argv[1:]
-    fields: list[str] = []
-    seen: set[str] = set()
-    for token in raw_argv:
-        # Expand combined short flags like -flsdc into -f -l -s -d -c.
-        # Also handle -cl, -cln, etc. Each char after the leading dash
-        # is treated as a separate short flag.
-        if token.startswith("-") and not token.startswith("--") and len(token) > 2:
-            tokens = [f"-{ch}" for ch in token[1:]]
-        else:
-            tokens = [token]
-        for t in tokens:
-            f = _flag_to_field.get(t)
-            if f and f not in seen:
-                fields.append(f)
-                seen.add(f)
+    fields = _parse_fields(raw_argv)
 
-    if not fields:
-        fields = _default_fields[:]
-
-    rolls: list[tuple[str, Path, list[Clip], list[Issue]]] = []
-
-    if len(args.paths) > 1:
-        # Multi-path mode: each argument is treated as a named roll
-        # directly — no grouping algorithm, insertion order preserved.
-        # The user is asserting what the rolls are; we trust the names
-        # but still validate contents for mixed-session or other issues.
-        for raw_path in args.paths:
-            target = Path(raw_path).resolve()
-            if not target.is_dir():
-                print(f"Error: '{target}' is not a directory.", file=sys.stderr)
-                return 1
-            clips, issues = find_clips(target)
-            roll_issues = list(issues) + validate_roll(clips)
-            rolls.append((target.name, target, clips, roll_issues))
-    else:
-        # Single-path mode (or bare invocation defaulting to "."):
-        # use _find_roll_dirs to locate rolls via known-parent detection.
-        raw_path = args.paths[0]
-        target = Path(raw_path).resolve()
-        if not target.is_dir():
-            print(f"Error: '{target}' is not a directory.", file=sys.stderr)
-            return 1
-        for roll_dir, dir_warnings in _find_roll_dirs(target):
-            for w in dir_warnings:
-                print(w, file=sys.stderr)
-            clips, issues = find_clips(roll_dir)
-            if not clips and not issues:
-                continue
-            roll_issues = list(issues) + validate_roll(clips)
-            rolls.append((roll_dir.name, roll_dir, clips, roll_issues))
-
+    rolls = _collect_rolls(args)
+    if rolls is None:
+        return 1  # invalid input path; error already reported
     if not rolls:
         print("Error: no media files found under any input path.", file=sys.stderr)
         return 1
 
-    multi = len(rolls) > 1
-
-    # Print diagnostics for any broken roll to stderr, regardless of
-    # single- or multi-roll mode. We do this before stdout so the user
-    # sees the warnings first (or at least adjacent) when stderr and
-    # stdout flow to the same terminal. For each broken roll we list
-    # every issue's message, prefixed with the roll name so it's clear
-    # which roll needs investigating.
-    had_issues = False
-    for name, _root, _clips, issues in rolls:
-        if not issues:
-            continue
-        had_issues = True
-        for issue in issues:
-            print(
-                f"Warning: roll '{name}' — {issue.message}",
-                file=sys.stderr,
-            )
-        print(
-            f"Warning: roll '{name}' has issues that need investigation; "
-            f"skipping output for this roll. Please check it manually.",
-            file=sys.stderr,
-        )
+    had_issues = _report_broken_rolls(rolls)
 
     # Drop broken rolls from stdout. Even if -s and -n would technically
     # be unaffected by the issue, emitting any partial value risks the
     # DIT pasting it into the log without realizing the roll is suspect.
     valid_rolls = [(n, root, c) for (n, root, c, i) in rolls if not i]
-
     if not valid_rolls:
         # Every roll was broken. Stderr already explained why; just
         # exit non-zero so calling shells/scripts notice.
         return 1
 
-    multi_valid = len(valid_rolls) > 1
-
-    want_roll = "roll" in fields
-    data_fields = [f for f in fields if f != "roll"]
-
-    # Format a header label: dimmed + underlined first character as flag hint.
-    def _fmt_header(label: str) -> str:
-        if not label:
-            return ""
-        return f"{DIM_ERR}{UNDERLINE_ERR}{label[0]}{RESET_ERR}{DIM_ERR}{label[1:]}{RESET_ERR}"
-
-    header_labels = [_field_to_header[f] for f in fields]
-
-    def _raw_row(name: str, roll_root: Path, clips: list[Clip]) -> list[str]:
-        """Return ordered cell values (strings) for one roll."""
-        data_line = render_roll(clips, data_fields, roll_root)
-        data_vals = data_line.split("\t") if data_line else []
-        di = 0
-        cells: list[str] = []
-        for f in fields:
-            if f == "roll":
-                cells.append(name)
-            else:
-                cells.append(data_vals[di] if di < len(data_vals) else "")
-                di += 1
-        return cells
-
-    # Collect all rows as cell lists so we can measure column widths.
-    all_rows: list[tuple[str, list[str]]] = [(name, _raw_row(name, root, clips)) for name, root, clips in valid_rolls]
-
-    # Column widths: max of header label length and any data cell in that column.
-    col_widths = [len(h) for h in header_labels]
-    for _name, cells in all_rows:
-        for i, cell in enumerate(cells):
-            if i < len(col_widths):
-                col_widths[i] = max(col_widths[i], len(cell))
-
-    def _pad_row(cells: list[str], widths: list[int], pad_last: bool = False) -> str:
-        """Space-pad each cell to its column width, join with a single tab.
-
-        The last cell is only padded when ``pad_last=True`` — i.e. when a
-        courtesy roll label follows and needs to land in an aligned column.
-        ``cells`` and ``widths`` must be the same length; a mismatch is a
-        bug but we handle it gracefully rather than crashing.
-        """
-        n = len(widths)
-        padded = []
-        for i, cell in enumerate(cells):
-            if i < n - 1 or pad_last:
-                padded.append(cell.ljust(widths[i] if i < n else 0))
-            else:
-                padded.append(cell)
-        return "\t".join(padded)
-
-    def _clipboard_tsv(rows: list[tuple[str, list[str]]]) -> str:
-        """Build strict TSV for clipboard: no padding, no header.
-
-        Cells come from ``_raw_row`` which only includes fields the user
-        requested — roll is present iff ``-r`` was given. No courtesy
-        labels, no trailing spaces, one row per line.
-        """
-        return "\n".join("\t".join(cells) for _name, cells in rows)
-
-    def _copy_to_clipboard(text: str) -> None:
-        """Copy ``text`` to the system clipboard. Silent no-op on failure.
-
-        Tries pyperclip first (handles macOS, Windows, Linux X11/Wayland,
-        WSL). Falls back to direct subprocess calls (pbcopy / clip / xclip)
-        if pyperclip is not installed.
-        """
-        try:
-            pyperclip.copy(text)
-            return
-        except Exception:
-            pass
-        # Stdlib fallback.
-        try:
-            if sys.platform == "darwin":
-                subprocess.run(["pbcopy"], input=text, text=True, check=False, **_POPEN_KW)
-            elif sys.platform == "win32":
-                subprocess.run(["clip"], input=text, text=True, check=False, **_POPEN_KW)
-            else:
-                for cmd in (
-                    ["xclip", "-selection", "clipboard"],
-                    ["xsel", "--clipboard", "--input"],
-                ):
-                    r = subprocess.run(cmd, input=text, text=True, check=False, **_POPEN_KW)
-                    if r.returncode == 0:
-                        break
-        except Exception:
-            pass  # Clipboard is best-effort; never crash the script.
-
-    if multi_valid or (multi and valid_rolls):
-        # Header to stderr — purely visual, never captured by pipes.
-        header_plain = [h for h in header_labels]
-        header_padded = [h.ljust(col_widths[i]) if i < len(col_widths) - 1 else h for i, h in enumerate(header_plain)]
-        header_str = "\t".join(_fmt_header(h) for h in header_padded)
-        print(header_str, file=sys.stderr)
-
-        for name, cells in all_rows:
-            row = _pad_row(cells, col_widths)
-            if not want_roll:
-                # Courtesy roll label as a trailing dimmed column, excluded
-                # from clipboard TSV since it's not in cells.
-                row = _pad_row(cells, col_widths, pad_last=True)
-                print(f"{row}\t{DIM}({name}){RESET}")
-            else:
-                print(row)
-
-        _copy_to_clipboard(_clipboard_tsv(all_rows))
-        return 1 if had_issues else 0
-
-    # Single valid roll.
-    name, cells = all_rows[0]
-    row = _pad_row(cells, col_widths)
-    if len(fields) > 1:
-        header_padded = [h.ljust(col_widths[i]) if i < len(col_widths) - 1 else h for i, h in enumerate(header_labels)]
-        header_str = "\t".join(_fmt_header(h) for h in header_padded)
-        print(header_str, file=sys.stderr)
-        print(row)
-    else:
-        print(_fmt_header(header_labels[0]), file=sys.stderr)
-        print(row)
-    _copy_to_clipboard(_clipboard_tsv(all_rows))
-    return 1 if had_issues else 0
+    return _render_rolls(valid_rolls, fields, multi=len(rolls) > 1, had_issues=had_issues)
 
 
 if __name__ == "__main__":
