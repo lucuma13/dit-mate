@@ -1431,15 +1431,15 @@ def _copy_to_clipboard(text: str) -> None:
     # Stdlib fallback.
     try:
         if sys.platform == "darwin":
-            invoke(["pbcopy"], input=text, text=True)
+            invoke(["pbcopy"], stdin_text=text, text=True)
         elif sys.platform == "win32":
-            invoke(["clip"], input=text, text=True)
+            invoke(["clip"], stdin_text=text, text=True)
         else:
             for cmd in (
                 ["xclip", "-selection", "clipboard"],
                 ["xsel", "--clipboard", "--input"],
             ):
-                if invoke(cmd, input=text, text=True).returncode == 0:
+                if invoke(cmd, stdin_text=text, text=True).returncode == 0:
                     break
     except OSError:
         pass  # Clipboard is best-effort; never crash the script.
