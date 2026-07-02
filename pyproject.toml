@@ -52,7 +52,7 @@ classifiers = [
   "Topic :: Utilities",
 ]
 dependencies = [
-  "humanize>=4.15",
+  "humanize>=4.16",
   "platformdirs>=4.10",
   "pyperclip>=1.11",
   "xxhash>=3.7.1",
