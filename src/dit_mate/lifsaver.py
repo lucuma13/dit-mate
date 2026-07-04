@@ -8,8 +8,8 @@ binaries, which are increasingly sandbox-restricted in Tahoe's security model.
 
 Usage:
     sudo lifsaver           # normal run
-    sudo lifsaver --dry-run # preview only, no writes
     sudo lifsaver --verbose # show raw stderr on failures
+    lifsaver --dry-run      # preview only, no writes
 """
 
 import argparse
@@ -17,9 +17,11 @@ import contextlib
 import importlib.metadata
 import os
 import plistlib
+import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import Literal
 
 # -----------------------------------------------------------------------------
 # Version
@@ -34,9 +36,27 @@ except importlib.metadata.PackageNotFoundError:  # pragma: no cover
 # Constants
 # ---------------------------------------------------------------------------
 
-EXTERNAL_FS_ALLOWLIST = frozenset(["Windows_FAT_32", "exFAT", "ExFAT", "Microsoft Basic Data"])
+# Partition "Content" values reported by `diskutil list -plist`. These name
+# MBR/GPT partition types, not filesystems:
+EXTERNAL_FS_ALLOWLIST = frozenset(
+    [
+        "DOS_FAT_32",  # MBR type 0x0B — FAT32 as formatted by macOS Disk Utility
+        "Windows_FAT_32",  # MBR type 0x0C (FAT32 LBA) — FAT32 as formatted by Windows / SD Formatter
+        "Windows_NTFS",  # MBR type 0x07 — shared by exFAT and NTFS; SDXC cards formatted in-camera report this
+        "Microsoft Basic Data",  # GPT Basic Data GUID — any FAT32/exFAT/NTFS partition on a GUID-partitioned card
+        "exFAT",  # filesystem personality names, never observed as real Content
+        "ExFAT",  # values (exFAT reports Windows_NTFS or Microsoft Basic Data)
+    ]
+)
 
 SEPARATOR = "-" * 56
+
+# Read-only queries (mount, diskutil info, pgrep) should return near-instantly;
+# mount attempts can legitimately stall on slow card readers, so they get longer.
+QUERY_TIMEOUT = 30
+MOUNT_TIMEOUT = 120
+
+MountOutcome = Literal["ok", "skip", "fail"]
 
 # ---------------------------------------------------------------------------
 # Mount-table helpers
@@ -52,7 +72,7 @@ def get_active_mounts() -> set[str]:
     """
     active: set[str] = set()
     try:
-        output = subprocess.run(["mount"], capture_output=True, text=True, check=True).stdout
+        output = subprocess.run(["mount"], capture_output=True, text=True, check=True, timeout=QUERY_TIMEOUT).stdout
         for line in output.splitlines():
             if line.startswith("/dev/"):
                 dev_path = line.split()[0]
@@ -70,6 +90,30 @@ def is_currently_mounted(dev_id: str) -> bool:
     return f"/dev/{dev_id}" in get_active_mounts()
 
 
+def is_fsck_active(dev_id: str) -> bool:
+    """
+    Detect whether macOS is running a background consistency check against
+    the device.  diskarbitrationd silently spawns fsck_exfat / fsck_msdos on
+    dirty cards before deciding whether to mount them; forcing a mount while
+    that repair is in flight races it and can corrupt the card.
+
+    Matches both /dev/diskXsY and the raw /dev/rdiskXsY node fsck actually
+    opens, without matching longer identifiers (disk4s1 ≠ disk4s10).
+    """
+    try:
+        result = subprocess.run(
+            ["pgrep", "-fl", "fsck"],
+            capture_output=True,
+            text=True,
+            check=False,  # pgrep exits 1 when nothing matches — not an error
+            timeout=QUERY_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    pattern = re.compile(rf"\br?{re.escape(dev_id)}\b")
+    return any(pattern.search(line) for line in result.stdout.splitlines())
+
+
 # ---------------------------------------------------------------------------
 # Disk introspection
 # ---------------------------------------------------------------------------
@@ -82,9 +126,10 @@ def get_disk_data() -> dict:
             ["diskutil", "list", "-plist"],
             capture_output=True,
             check=True,
+            timeout=QUERY_TIMEOUT,
         )
         return plistlib.loads(result.stdout)
-    except subprocess.CalledProcessError as exc:
+    except (OSError, subprocess.SubprocessError, plistlib.InvalidFileException) as exc:
         print(f"CRITICAL: Failed to query diskutil: {exc}", file=sys.stderr)
         sys.exit(1)
 
@@ -102,6 +147,7 @@ def get_partition_fs_type(dev_id: str) -> str:
             ["diskutil", "info", "-plist", dev_id],
             capture_output=True,
             check=True,
+            timeout=QUERY_TIMEOUT,
         )
         info = plistlib.loads(result.stdout)
         # 'FilesystemType' is the canonical key; fall back to content hint
@@ -144,7 +190,10 @@ def filter_target_partitions(disk_data: dict) -> list[str]:
             if not dev_id:
                 continue
 
-            # Blocklist: EFI, recovery, and Apple container types
+            # Blocklist: EFI, recovery, and Apple container types.
+            # Redundant with the allowlist today, but kept as a second interlock:
+            # the allowlist uses substring matching and gets edited — a future broad
+            # token must still never expose Apple/EFI system partitions.
             blocked = any(
                 token in content_type
                 for token in [
@@ -185,12 +234,18 @@ def _run_diskutil_mount(dev_id: str, verbose: bool) -> bool:
     diskutil handles filesystem detection, SIP/LIFS sandboxing, and
     mount-point creation automatically.
     """
-    result = subprocess.run(
-        ["diskutil", "mount", dev_id],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            ["diskutil", "mount", dev_id],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=MOUNT_TIMEOUT,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        if verbose:
+            print(f"  [diskutil error] {exc}", file=sys.stderr)
+        return False
     if verbose and result.stderr:
         print(f"  [diskutil stderr] {result.stderr.strip()}", file=sys.stderr)
     return result.returncode == 0
@@ -207,7 +262,12 @@ def _run_raw_mount(dev_id: str, fs_type: str, verbose: bool) -> bool:
     dev_path = f"/dev/{dev_id}"
     mount_point = Path(f"/Volumes/Camera_Data_{dev_id}")
 
-    mount_point.mkdir(parents=True, exist_ok=True)
+    try:
+        mount_point.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        if verbose:
+            print(f"  [mount-point error] {exc}", file=sys.stderr)
+        return False
 
     # Determine mount sequence: honour detected fs_type when available
     if fs_type in ("msdos", "fat", "fat32"):
@@ -223,7 +283,14 @@ def _run_raw_mount(dev_id: str, fs_type: str, verbose: bool) -> bool:
         ]
 
     for cmd in candidates:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=MOUNT_TIMEOUT)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            # Missing binary (removed in newer macOS) or a hung card reader:
+            # move on to the next candidate rather than crashing.
+            if verbose:
+                print(f"  [{cmd[0].split('/')[-1]} error] {exc}", file=sys.stderr)
+            continue
         if verbose and result.stderr:
             print(
                 f"  [{cmd[0].split('/')[-1]} stderr] {result.stderr.strip()}",
@@ -239,21 +306,28 @@ def _run_raw_mount(dev_id: str, fs_type: str, verbose: bool) -> bool:
     return False
 
 
-def execute_mount(dev_id: str, dry_run: bool = False, verbose: bool = False) -> bool:
+def execute_mount(dev_id: str, dry_run: bool = False, verbose: bool = False) -> MountOutcome:
     """
     Orchestrate the full mount sequence for a single device identifier.
 
     Strategy (macOS Tahoe / LIFS-aware):
       1. Re-confirm the device is still unmounted (race-condition guard).
-      2. Try `diskutil mount` — preferred; handles LIFS sandboxing.
-      3. Fall back to raw mount binaries if diskutil fails.
+      2. Stand down if macOS is mid consistency check on the device.
+      3. Try `diskutil mount` — preferred; handles LIFS sandboxing.
+      4. Fall back to raw mount binaries if diskutil fails.
     """
     print(f"\nTarget: /dev/{dev_id}")
 
     # Re-query live mount table immediately before acting (race guard)
     if is_currently_mounted(dev_id):
         print(f"  SKIPPED — /dev/{dev_id} became mounted since scan.")
-        return False
+        return "skip"
+
+    # Never fight a repair in progress — wait for macOS to finish or bail out.
+    if is_fsck_active(dev_id):
+        print(f"  SKIPPED — macOS is running a consistency check (fsck) on /dev/{dev_id}.")
+        print("  Let it finish and re-run; mounting mid-check risks corrupting the card.")
+        return "skip"
 
     fs_type = get_partition_fs_type(dev_id)
     if fs_type:
@@ -261,23 +335,23 @@ def execute_mount(dev_id: str, dry_run: bool = False, verbose: bool = False) -> 
 
     if dry_run:
         print(f"  DRY-RUN: would attempt to mount /dev/{dev_id}")
-        return True
+        return "ok"
 
     # --- Attempt 1: diskutil mount (Tahoe-safe) ---
     print("  Attempting diskutil mount...")
     if _run_diskutil_mount(dev_id, verbose) and is_currently_mounted(dev_id):
         mount_point = _find_mount_point(dev_id)
         print(f"  SUCCESS via diskutil → {mount_point or '(see /Volumes)'}")
-        return True
+        return "ok"
 
     # --- Attempt 2: raw mount binaries ---
     print("  diskutil mount failed; falling back to raw mount binaries...")
     if _run_raw_mount(dev_id, fs_type, verbose) and is_currently_mounted(dev_id):
         print(f"  SUCCESS via raw mount → /Volumes/Camera_Data_{dev_id}")
-        return True
+        return "ok"
 
     print(f"  CRITICAL ERROR: All mount strategies rejected /dev/{dev_id}")
-    return False
+    return "fail"
 
 
 def _find_mount_point(dev_id: str) -> str:
@@ -286,7 +360,7 @@ def _find_mount_point(dev_id: str) -> str:
 
     dev_path = f"/dev/{dev_id}"
     try:
-        output = subprocess.run(["mount"], capture_output=True, text=True, check=True).stdout
+        output = subprocess.run(["mount"], capture_output=True, text=True, check=True, timeout=QUERY_TIMEOUT).stdout
         for line in output.splitlines():
             if line.startswith(dev_path + " "):
                 # format: /dev/diskXsY on /Volumes/NAME (type, options)
@@ -344,8 +418,9 @@ def main() -> None:
     check_platform()
     args = parse_args()
 
-    # Re-exec with sudo, preserving all original arguments
-    if os.getuid() != 0:
+    # Re-exec with sudo, preserving all original arguments.
+    # Dry-run only performs read-only queries, so it never needs root.
+    if os.getuid() != 0 and not args.dry_run:
         print("Root access required. Re-running with sudo...")
         os.execvp("sudo", ["sudo", sys.executable, *sys.argv])
 
@@ -367,13 +442,16 @@ def main() -> None:
     results = {"ok": 0, "fail": 0, "skip": 0}
     for dev_id in targets:
         outcome = execute_mount(dev_id, dry_run=args.dry_run, verbose=args.verbose)
-        if outcome:
-            results["ok"] += 1
-        else:
-            results["fail"] += 1
+        results[outcome] += 1
         print(SEPARATOR)
 
+    if args.dry_run:
+        print(f"Done — {results['ok']} mountable, {results['skip']} skipped.")
+        return
+
     print(f"Done — {results['ok']} mounted, {results['fail']} failed, {results['skip']} skipped.")
+    if results["fail"]:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
