@@ -4,7 +4,8 @@ import plistlib
 import subprocess
 import sys
 import tomllib
-from unittest.mock import MagicMock, patch
+from typing import ClassVar
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -47,11 +48,6 @@ def _completed(returncode=0, stdout="", stderr=""):
 MOUNT_OUTPUT_TEMPLATE = """\
 /dev/disk1s1 on / (apfs, local, read-only, journaled)
 /dev/disk3s1 on /Volumes/NO_NAME (msdos, local, nodev, nosuid, noowners)
-"""
-
-MOUNT_OUTPUT_WITH_CARD = """\
-/dev/disk1s1 on / (apfs, local, read-only, journaled)
-/dev/disk4s1 on /Volumes/CAMERA (exfat, local, nodev, nosuid, noowners)
 """
 
 DISKUTIL_PLIST_EXTERNAL_EXFAT = {
@@ -126,8 +122,8 @@ DISKUTIL_PLIST_MULTI = {
             "Partitions": [
                 {"DeviceIdentifier": "disk4s1", "Content": "EFI"},
                 {"DeviceIdentifier": "disk4s2", "Content": "Microsoft Basic Data"},
-                {"DeviceIdentifier": "disk4s3", "Content": "DOS_FAT"},
-                {"DeviceIdentifier": "disk4s4", "Content": "NTFS"},
+                {"DeviceIdentifier": "disk4s3", "Content": "DOS_FAT_32"},
+                {"DeviceIdentifier": "disk4s4", "Content": "Windows_NTFS"},
             ],
         },
         {
@@ -154,7 +150,7 @@ class TestDitMateVersion:
         assert isinstance(lifsaver.__version__, str)
         assert lifsaver.__version__ != ""
 
-    def test_missing_version_key_raises_key_error(self, tmp_path):
+    def test_missing_version_key_raises_key_error(self):
         """A toml without [project].version must raise KeyError, not silently return None."""
         data = tomllib.loads('[project]\nname = "dit-mate"')
         with pytest.raises(KeyError):
@@ -174,7 +170,7 @@ class TestDitMateVersion:
         assert lifsaver.__version__ in out
 
     def test_version_flag_output_contains_script_name(self, capsys):
-        """--version output must include the script name, not just a bare number."""
+        """--version output must be a bare number."""
         with patch.object(sys, "argv", ["lifsaver", "--version"]), pytest.raises(SystemExit):
             lifsaver.parse_args()
         out = capsys.readouterr().out
@@ -309,6 +305,100 @@ class TestMainPlatformGuard:
 
 
 # ===========================================================================
+# TestMainHappyPath
+# ===========================================================================
+
+
+class TestMainHappyPath:
+    """Verify main()'s wiring on (mocked) darwin: sudo guard → scan → filter → mount → summary."""
+
+    DISK_DATA: ClassVar[dict] = {"AllDisksAndPartitions": []}
+
+    def test_mounts_each_target_with_forwarded_flags(self, capsys):
+        with (
+            patch.object(sys, "platform", "darwin"),
+            patch.object(sys, "argv", ["lifsaver", "--verbose"]),
+            patch("os.getuid", return_value=0),
+            patch.object(lifsaver, "get_disk_data", return_value=self.DISK_DATA),
+            patch.object(lifsaver, "filter_target_partitions", return_value=["disk4s1", "disk5s2"]),
+            patch.object(lifsaver, "execute_mount", return_value="ok") as mock_mount,
+        ):
+            lifsaver.main()
+
+        assert mock_mount.call_args_list == [
+            call("disk4s1", dry_run=False, verbose=True),
+            call("disk5s2", dry_run=False, verbose=True),
+        ]
+        assert "2 mounted, 0 failed, 0 skipped" in capsys.readouterr().out
+
+    def test_disk_data_is_passed_to_filter(self):
+        with (
+            patch.object(sys, "platform", "darwin"),
+            patch.object(sys, "argv", ["lifsaver"]),
+            patch("os.getuid", return_value=0),
+            patch.object(lifsaver, "get_disk_data", return_value=self.DISK_DATA),
+            patch.object(lifsaver, "filter_target_partitions", return_value=[]) as mock_filter,
+        ):
+            lifsaver.main()
+
+        mock_filter.assert_called_once_with(self.DISK_DATA)
+
+    def test_no_targets_prints_message_without_mounting(self, capsys):
+        with (
+            patch.object(sys, "platform", "darwin"),
+            patch.object(sys, "argv", ["lifsaver"]),
+            patch("os.getuid", return_value=0),
+            patch.object(lifsaver, "get_disk_data", return_value=self.DISK_DATA),
+            patch.object(lifsaver, "filter_target_partitions", return_value=[]),
+            patch.object(lifsaver, "execute_mount") as mock_mount,
+        ):
+            lifsaver.main()
+
+        mock_mount.assert_not_called()
+        assert "No stalled or unmounted camera data volumes detected." in capsys.readouterr().out
+
+    def test_non_root_reexecs_with_sudo_preserving_argv(self):
+        with (
+            patch.object(sys, "platform", "darwin"),
+            patch.object(sys, "argv", ["lifsaver", "--verbose"]),
+            patch("os.getuid", return_value=501),
+            patch("os.execvp") as mock_execvp,
+            patch.object(lifsaver, "get_disk_data", return_value=self.DISK_DATA),
+            patch.object(lifsaver, "filter_target_partitions", return_value=[]),
+        ):
+            lifsaver.main()
+
+        mock_execvp.assert_called_once_with("sudo", ["sudo", sys.executable, "lifsaver", "--verbose"])
+
+    def test_root_does_not_reexec(self):
+        with (
+            patch.object(sys, "platform", "darwin"),
+            patch.object(sys, "argv", ["lifsaver"]),
+            patch("os.getuid", return_value=0),
+            patch("os.execvp") as mock_execvp,
+            patch.object(lifsaver, "get_disk_data", return_value=self.DISK_DATA),
+            patch.object(lifsaver, "filter_target_partitions", return_value=[]),
+        ):
+            lifsaver.main()
+
+        mock_execvp.assert_not_called()
+
+    def test_dry_run_as_non_root_does_not_reexec(self):
+        """Dry-run only performs read-only queries, so it must never escalate to root."""
+        with (
+            patch.object(sys, "platform", "darwin"),
+            patch.object(sys, "argv", ["lifsaver", "--dry-run"]),
+            patch("os.getuid", return_value=501),
+            patch("os.execvp") as mock_execvp,
+            patch.object(lifsaver, "get_disk_data", return_value=self.DISK_DATA),
+            patch.object(lifsaver, "filter_target_partitions", return_value=[]),
+        ):
+            lifsaver.main()
+
+        mock_execvp.assert_not_called()
+
+
+# ===========================================================================
 # get_active_mounts
 # ===========================================================================
 
@@ -359,6 +449,48 @@ class TestIsCurrentlyMounted:
             lifsaver.is_currently_mounted("disk4s1")
             lifsaver.is_currently_mounted("disk4s1")
         assert mock_game.call_count == 2
+
+
+# ===========================================================================
+# is_fsck_active
+# ===========================================================================
+
+
+class TestIsFsckActive:
+    def test_true_when_fsck_targets_device(self):
+        pgrep_out = "812 /System/Library/Filesystems/exfat.fs/Contents/Resources/fsck_exfat -y /dev/rdisk4s1\n"
+        with patch("subprocess.run", return_value=_completed(stdout=pgrep_out)):
+            assert lifsaver.is_fsck_active("disk4s1") is True
+
+    def test_matches_non_raw_device_node(self):
+        pgrep_out = "812 fsck_msdos -y /dev/disk4s1\n"
+        with patch("subprocess.run", return_value=_completed(stdout=pgrep_out)):
+            assert lifsaver.is_fsck_active("disk4s1") is True
+
+    def test_false_when_fsck_targets_other_device(self):
+        pgrep_out = "812 fsck_exfat -y /dev/rdisk5s1\n"
+        with patch("subprocess.run", return_value=_completed(stdout=pgrep_out)):
+            assert lifsaver.is_fsck_active("disk4s1") is False
+
+    def test_no_false_match_on_longer_identifier(self):
+        """disk4s1 must not match a check running on disk4s10."""
+        pgrep_out = "812 fsck_exfat -y /dev/rdisk4s10\n"
+        with patch("subprocess.run", return_value=_completed(stdout=pgrep_out)):
+            assert lifsaver.is_fsck_active("disk4s1") is False
+
+    def test_no_false_match_inside_longer_token(self):
+        """disk4s1 must not match in the middle of an unrelated word like 'mydisk4s1'."""
+        pgrep_out = "812 fsck_exfat -y /dev/mydisk4s1\n"
+        with patch("subprocess.run", return_value=_completed(stdout=pgrep_out)):
+            assert lifsaver.is_fsck_active("disk4s1") is False
+
+    def test_false_when_no_fsck_running(self):
+        with patch("subprocess.run", return_value=_completed(returncode=1, stdout="")):
+            assert lifsaver.is_fsck_active("disk4s1") is False
+
+    def test_false_on_pgrep_failure(self):
+        with patch("subprocess.run", side_effect=OSError("boom")):
+            assert lifsaver.is_fsck_active("disk4s1") is False
 
 
 # ===========================================================================
@@ -455,13 +587,15 @@ class TestFilterTargetPartitions:
         assert "already mounted" in capsys.readouterr().out
 
     def test_multi_disk_multi_partition(self):
-        # disk4s1=EFI(skip), disk4s2=MBD(ok), disk4s3=DOS_FAT(ok), disk5s1=exfat(ok)
+        # disk4s1=EFI(skip), disk4s2=MBD(ok), disk4s3=DOS_FAT_32(ok),
+        # disk4s4=Windows_NTFS(ok — exFAT and NTFS share MBR type 0x07),
+        # disk5: personality-name variants; only allowlisted spellings match
         with self._patch_mounts():
             targets = lifsaver.filter_target_partitions(DISKUTIL_PLIST_MULTI)
         assert "disk4s1" not in targets
         assert "disk4s2" in targets
-        assert "disk4s3" not in targets
-        assert "disk4s4" not in targets
+        assert "disk4s3" in targets
+        assert "disk4s4" in targets
         assert "disk5s1" in targets
         assert "disk5s2" in targets
         assert "disk5s3" not in targets
@@ -488,6 +622,9 @@ class TestFilterTargetPartitions:
         "content_type",
         [
             "Microsoft Basic Data",
+            "DOS_FAT_32",
+            "Windows_FAT_32",
+            "Windows_NTFS",
             "exFAT",
             "ExFAT",
         ],
@@ -561,7 +698,7 @@ class TestRunDiskutilMount:
 
 
 class TestRunRawMount:
-    def test_exfat_tried_first_for_unknown_fs(self, tmp_path):
+    def test_exfat_tried_first_for_unknown_fs(self):
         calls = []
 
         def fake_run(cmd, **kwargs):
@@ -573,7 +710,7 @@ class TestRunRawMount:
 
         assert "mount_exfat" in calls[0]
 
-    def test_msdos_tried_first_for_fat32(self, tmp_path):
+    def test_msdos_tried_first_for_fat32(self):
         calls = []
 
         def fake_run(cmd, **kwargs):
@@ -593,7 +730,7 @@ class TestRunRawMount:
 
         assert result is True
 
-    def test_returns_false_when_both_fail(self, tmp_path):
+    def test_returns_false_when_both_fail(self):
         with (
             patch("subprocess.run", return_value=_completed(returncode=1)),
             patch("pathlib.Path.mkdir"),
@@ -603,6 +740,17 @@ class TestRunRawMount:
 
         assert result is False
         mock_rmdir.assert_called_once()
+
+    def test_returns_false_when_mount_point_creation_fails(self, capsys):
+        with (
+            patch("pathlib.Path.mkdir", side_effect=PermissionError("read-only /Volumes")),
+            patch("subprocess.run") as mock_run,
+        ):
+            result = lifsaver._run_raw_mount("disk4s1", fs_type="", verbose=True)
+
+        assert result is False
+        mock_run.assert_not_called()
+        assert "read-only /Volumes" in capsys.readouterr().err
 
     def test_rmdir_not_called_on_success(self):
         with (
@@ -631,35 +779,61 @@ class TestRunRawMount:
 
 
 class TestExecuteMount:
-    def test_dry_run_returns_true_without_mounting(self):
+    def test_dry_run_returns_ok_without_mounting(self):
         with (
             patch.object(lifsaver, "is_currently_mounted", return_value=False),
+            patch.object(lifsaver, "is_fsck_active", return_value=False),
             patch.object(lifsaver, "get_partition_fs_type", return_value="exfat"),
             patch.object(lifsaver, "_run_diskutil_mount") as mock_du,
         ):
             result = lifsaver.execute_mount("disk4s1", dry_run=True)
 
-        assert result is True
+        assert result == "ok"
         mock_du.assert_not_called()
 
     def test_skips_if_mounted_since_scan(self, capsys):
         with patch.object(lifsaver, "is_currently_mounted", return_value=True):
             result = lifsaver.execute_mount("disk4s1")
-        assert result is False
+        assert result == "skip"
         assert "SKIPPED" in capsys.readouterr().out
+
+    def test_skips_when_fsck_is_active(self, capsys):
+        with (
+            patch.object(lifsaver, "is_currently_mounted", return_value=False),
+            patch.object(lifsaver, "is_fsck_active", return_value=True),
+            patch.object(lifsaver, "_run_diskutil_mount") as mock_du,
+            patch.object(lifsaver, "_run_raw_mount") as mock_raw,
+        ):
+            result = lifsaver.execute_mount("disk4s1")
+
+        assert result == "skip"
+        assert "consistency check" in capsys.readouterr().out
+        mock_du.assert_not_called()
+        mock_raw.assert_not_called()
+
+    def test_fsck_gate_applies_to_dry_run_too(self, capsys):
+        with (
+            patch.object(lifsaver, "is_currently_mounted", return_value=False),
+            patch.object(lifsaver, "is_fsck_active", return_value=True),
+        ):
+            result = lifsaver.execute_mount("disk4s1", dry_run=True)
+
+        assert result == "skip"
+        assert "fsck" in capsys.readouterr().out
 
     def test_succeeds_via_diskutil(self):
         mounted_sequence = [False, True]  # unmounted at check, mounted after diskutil
 
         with (
             patch.object(lifsaver, "is_currently_mounted", side_effect=mounted_sequence),
+            patch.object(lifsaver, "is_fsck_active", return_value=False),
             patch.object(lifsaver, "get_partition_fs_type", return_value="exfat"),
             patch.object(lifsaver, "_run_diskutil_mount", return_value=True),
             patch.object(lifsaver, "_find_mount_point", return_value="/Volumes/CARD"),
         ):
             result = lifsaver.execute_mount("disk4s1")
 
-        assert result is True
+        assert result == "ok"
 
     def test_falls_back_to_raw_mount_when_diskutil_fails(self):
         # Call sequence for is_currently_mounted:
@@ -671,25 +845,65 @@ class TestExecuteMount:
 
         with (
             patch.object(lifsaver, "is_currently_mounted", side_effect=mounted_sequence),
+            patch.object(lifsaver, "is_fsck_active", return_value=False),
             patch.object(lifsaver, "get_partition_fs_type", return_value=""),
             patch.object(lifsaver, "_run_diskutil_mount", return_value=False),
             patch.object(lifsaver, "_run_raw_mount", return_value=True),
         ):
             result = lifsaver.execute_mount("disk4s1")
 
-        assert result is True
+        assert result == "ok"
 
-    def test_returns_false_when_all_strategies_fail(self, capsys):
+    def test_returns_fail_when_all_strategies_fail(self, capsys):
         with (
             patch.object(lifsaver, "is_currently_mounted", return_value=False),
+            patch.object(lifsaver, "is_fsck_active", return_value=False),
             patch.object(lifsaver, "get_partition_fs_type", return_value=""),
             patch.object(lifsaver, "_run_diskutil_mount", return_value=False),
             patch.object(lifsaver, "_run_raw_mount", return_value=False),
         ):
             result = lifsaver.execute_mount("disk4s1")
 
-        assert result is False
+        assert result == "fail"
         assert "CRITICAL ERROR" in capsys.readouterr().out
+
+
+# ===========================================================================
+# main summary / exit code
+# ===========================================================================
+
+
+class TestMainSummary:
+    def _run_main(self, argv, outcome):
+        with (
+            patch.object(sys, "platform", "darwin"),
+            patch.object(sys, "argv", argv),
+            patch("os.getuid", return_value=0),
+            patch.object(lifsaver, "get_disk_data", return_value={}),
+            patch.object(lifsaver, "filter_target_partitions", return_value=["disk4s1"]),
+            patch.object(lifsaver, "execute_mount", return_value=outcome),
+        ):
+            lifsaver.main()
+
+    def test_dry_run_summary_says_mountable(self, capsys):
+        """Dry-run must not claim volumes were mounted or could have failed."""
+        self._run_main(["lifsaver", "--dry-run"], outcome="ok")
+        out = capsys.readouterr().out
+        assert "1 mountable" in out
+        assert "mounted" not in out
+        assert "failed" not in out
+
+    def test_real_run_summary_says_mounted(self, capsys):
+        self._run_main(["lifsaver"], outcome="ok")
+        assert "1 mounted" in capsys.readouterr().out
+
+    def test_exits_nonzero_when_a_mount_fails(self):
+        with pytest.raises(SystemExit) as exc_info:
+            self._run_main(["lifsaver"], outcome="fail")
+        assert exc_info.value.code == 1
+
+    def test_exits_zero_when_all_mounts_succeed(self):
+        self._run_main(["lifsaver"], outcome="ok")  # must not raise SystemExit
 
 
 # ===========================================================================
