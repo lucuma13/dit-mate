@@ -55,7 +55,7 @@ dependencies = [
   "humanize>=4.16",
   "platformdirs>=4.10",
   "pyperclip>=1.11",
-  "xxhash>=3.7.1",
+  "xxhash>=3.8.1",
 ]
 urls.Homepage = "https://github.com/lucuma13/dit-mate"
 scripts.basicmeta = "dit_mate.basicmeta:main"
