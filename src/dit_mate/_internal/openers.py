@@ -1,9 +1,42 @@
-"""Open files in the OS default app or the user's editor — shared by the CLIs."""
+"""Open files in the OS default app or the user's editor."""
 
 import os
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
+
+
+def maybe_open_config(
+    path: Path,
+    *,
+    open_app: bool,
+    edit: bool,
+    label: str,
+    ensure: Callable[[], None] | None = None,
+) -> bool:
+    """Handle the -O/-E config-opening flags. Returns True if one fired
+    (the caller should return immediately).
+
+    The flags themselves stay declared in each tool's parser — this helper
+    only takes the parsed booleans, so each script remains the single,
+    complete declaration of its CLI surface.
+
+    ``ensure`` is called to create the file if missing (xpandroll's blank
+    TSV); without it, a missing file is a hard error (mkday/mrl presets).
+    """
+    if not (open_app or edit):
+        return False
+    if ensure is not None:
+        ensure()
+    elif not path.exists():
+        sys.exit(f"❌  Config file not found: {path}")
+    if open_app:
+        open_in_default_app(path, label=label)
+    else:
+        print(f"📋  {label.capitalize()}: {path}")
+        open_in_editor(path, label=label)
+    return True
 
 
 def open_in_default_app(path: Path, *, label: str) -> None:
