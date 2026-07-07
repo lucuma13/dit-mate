@@ -32,6 +32,7 @@ from pathlib import Path
 
 from dit_mate._internal import term
 from dit_mate._internal.binaries import run_capture
+from dit_mate._internal.utils import FieldOrderAction
 
 # -----------------------------------------------------------------------------
 # Version
@@ -78,17 +79,16 @@ UNDERLINE = term.UNDERLINE if _COLOR else ""  # column headers
 RESET = term.RESET if _COLOR else ""
 
 #: Broadcast-standard frame rates. fps strings not in this set are
-#: coloured orange as a heads-up that the rate is unusual.
+#: coloured orange as a heads-up that the rate is unusual. Entries must be
+#: in _norm_fps's canonical form: trailing zeros stripped.
 KNOWN_FPS = {
     "23.976",
     "23.97",
     "24",
     "25",
-    "29.970",
     "29.97",
     "30",
     "50",
-    "59.940",
     "59.94",
     "60",
 }
@@ -160,27 +160,26 @@ HAS_NONZERO_DIGIT = re.compile(r"[1-9]")
 def _norm_fps(s: str) -> str:
     """Normalize a frame-rate value to the display form used by basicmeta.
 
-    Behavior matches the original Bash version: parses any numeric input,
-    formats with three decimal places, then strips a trailing ``.000`` so
-    integer rates render as ``"24"`` instead of ``"24.000"``. Non-numeric
-    input is returned unchanged (apart from leading/trailing whitespace).
+    Parses any numeric input, formats with three decimal places, then strips
+    trailing zeros (and a dangling ``.``) so every rate collapses to one
+    canonical form. Non-numeric input is returned unchanged (apart from
+    leading/trailing whitespace). KNOWN_FPS entries must use these same
+    shortest forms.
 
     Args:
         s: raw frame rate as reported by mediainfo or exiftool.
 
     Returns:
         ``""`` if the input was empty/whitespace, otherwise a clean
-        display string like ``"23.976"``, ``"24"``, or ``"29.970"``.
+        display string like ``"23.976"``, ``"24"``, or ``"29.97"``.
     """
     s = (s or "").strip()
     if not s:
         return ""
     try:
-        # Format with 3 decimals to match the original's printf "%.3f",
-        # then strip ".000" so integer rates display compactly.
+        # Format with 3 decimals, then strip trailing zeros.
         f = float(s)
-        out = f"{f:.3f}"
-        return out.removesuffix(".000")
+        return f"{f:.3f}".rstrip("0").rstrip(".")
     except ValueError:
         # Non-numeric values (rare — usually a sentinel like "VFR")
         # pass through, with the same .000 trimming applied textually.
@@ -241,9 +240,10 @@ def batch_mediainfo(paths: list[Path]) -> dict[Path, _MetaRow]:
             returned in that case (no subprocess is launched).
 
     Returns:
-        A dict mapping each input path to a 4-tuple
-        ``(fps_raw, res_raw, date_raw, name)`` — all plain strings
-        for the caller to render with the active field list.
+        A dict mapping each input path to a ``_MetaRow`` 5-tuple
+        ``(fps, res, date, sn, name)`` — all plain strings for the caller
+        to render with the active field list (``sn`` is always ``""``
+        here; mediainfo doesn't report serial numbers).
     """
     if not paths:
         return {}
@@ -309,20 +309,15 @@ def batch_mediainfo(paths: list[Path]) -> dict[Path, _MetaRow]:
         w = w_raw.strip() if isinstance(w_raw, str) else str(w_raw).strip()
         h = h_raw.strip() if isinstance(h_raw, str) else str(h_raw).strip()
         res = f"{w} x {h}" if (w and h) else ""
-        res_colour = ORANGE if _res_is_low(res) else ""
 
         # FileNameExtension is the bare filename (e.g. "clip_001.mov"), not
         # just the extension — confusing but matches the original tool.
         ext_name = gen.get("FileNameExtension") or p.name
 
-        coloured_res = f"{res_colour}{res}{RESET if res_colour else ''}"
-        results[p] = (
-            fps_raw,
-            coloured_res if res_colour else res,
-            date,
-            "",
-            ext_name or p.name,
-        )
+        # Plain strings only — colour is applied at render time by
+        # _build_field_cells, and the consistency summary compares these
+        # values across handlers.
+        results[p] = (fps_raw, res, date, "", ext_name or p.name)
 
     return results
 
@@ -542,8 +537,9 @@ def batch_r3d(paths: list[Path]) -> dict[Path, _MetaRow]:
         paths: R3D files to analyze. May be empty.
 
     Returns:
-        A dict mapping each input path to a 4-tuple
-        ``(line, fps_raw, res_raw, date_raw)`` for consistency checking.
+        A dict mapping each input path to a ``_MetaRow`` 5-tuple
+        ``(fps, res, date, sn, name)`` for rendering and consistency
+        checking.
     """
     if not paths:
         return {}
@@ -637,8 +633,9 @@ def batch_wav(paths: list[Path]) -> dict[Path, _MetaRow]:
         paths: WAV files to analyze. May be empty.
 
     Returns:
-        A dict mapping each input path to a 4-tuple
-        ``(line, fps_raw, "Audio", date_raw)`` for consistency checking.
+        A dict mapping each input path to a ``_MetaRow`` 5-tuple
+        ``(fps, "Audio", date, "", name)`` for rendering and consistency
+        checking.
     """
     if not paths:
         return {}
@@ -652,7 +649,6 @@ def batch_wav(paths: list[Path]) -> dict[Path, _MetaRow]:
             # value wins. iXML's BWF tags are the most authoritative for
             # location-sound recordings.
             "-BwfxmlSpeedTimecodeRate",
-            "-iXML:SampleRate",
             "-Speed",
             "-VideoFrameRate",
             # Date aliases. We probe all of them and take the first that
@@ -660,6 +656,7 @@ def batch_wav(paths: list[Path]) -> dict[Path, _MetaRow]:
             # placeholder dates when no system clock is set.
             "-DateTimeOriginal",
             "-DateCreated",
+            "-OriginatorReference",
             "-BwfxmlBextBwfOriginationDate",
             "-Filename",
             *map(str, paths),
@@ -670,7 +667,7 @@ def batch_wav(paths: list[Path]) -> dict[Path, _MetaRow]:
     # Probe order matters: try the most-specific tags first so a recorder
     # that writes both BWF timecode rate and a generic VideoFrameRate ends
     # up with the BWF value (which is the intended audio reference).
-    fps_keys = ("BwfxmlSpeedTimecodeRate", "VideoFrameRate", "Speed", "iXML")
+    fps_keys = ("BwfxmlSpeedTimecodeRate", "VideoFrameRate", "Speed")
     date_keys = (
         "DateTimeOriginal",
         "DateCreated",
@@ -703,7 +700,7 @@ def batch_wav(paths: list[Path]) -> dict[Path, _MetaRow]:
 
 
 # ---------------------------------------------------------------------------
-# Driver: directory walk, dispatch, and output assembly
+# Serial-number lookup (separate on-demand exiftool call)
 # ---------------------------------------------------------------------------
 
 
@@ -941,13 +938,6 @@ def _check_dependencies() -> None:
 # ---------------------------------------------------------------------------
 
 
-_FLAG_TO_FIELD = {
-    "--fps": "fps",
-    "--resolution": "resolution",
-    "--date": "date",
-    "--sn": "sn",
-    "--serialnumber": "sn",
-}
 # "sn" is intentionally excluded from the default set — it triggers an extra
 # exiftool call and must only run when explicitly requested.
 _DEFAULT_FIELDS = ["fps", "resolution", "date"]
@@ -965,6 +955,7 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="basicmeta",
         description="Basic metadata utility for sanity checking original camera files",
     )
+    p.set_defaults(field_order=[])
     p.add_argument("path", nargs="?", default=".", help="file or directory to analyze (default: current dir)")
     p.add_argument(
         "-f",
@@ -972,34 +963,19 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="force analysis of non-camera video containers (MKV, AVI, M4V, MTS, FLV, WebM)",
     )
-    p.add_argument("--fps", action="store_true", help="print frame rate")
-    p.add_argument("--resolution", action="store_true", help="print resolution")
-    p.add_argument("--date", action="store_true", help="print encoded date")
+    p.add_argument("--fps", action=FieldOrderAction, field="fps", help="print frame rate")
+    p.add_argument("--resolution", action=FieldOrderAction, field="resolution", help="print resolution")
+    p.add_argument("--date", action=FieldOrderAction, field="date", help="print encoded date")
     p.add_argument(
         "--sn",
         "--serialnumber",
         dest="sn",
-        action="store_true",
+        action=FieldOrderAction,
+        field="sn",
         help="print camera serial number (extra exiftool call for non-R3D files)",
     )
     p.add_argument("--version", action="version", version=__version__)
     return p
-
-
-def _parse_fields(raw_argv: list[str]) -> list[str]:
-    """Build the ordered field list from argv token order.
-
-    Preserves the order flags were typed. No field flags → the default
-    fields (``sn`` excluded — see ``_DEFAULT_FIELDS``).
-    """
-    fields: list[str] = []
-    seen: set[str] = set()
-    for token in raw_argv:
-        f = _FLAG_TO_FIELD.get(token)
-        if f and f not in seen:
-            fields.append(f)
-            seen.add(f)
-    return fields or _DEFAULT_FIELDS[:]
 
 
 def _format_line(t: _MetaRow, fields: list[str], *, sn_extra: str = "", audio: bool = False) -> str:
@@ -1013,8 +989,8 @@ def _format_line(t: _MetaRow, fields: list[str], *, sn_extra: str = "", audio: b
     return _render_line(vals, name, fields, audio=audio)
 
 
-def _render_single_file(target: Path, fields: list[str], *, force: bool) -> None:
-    """Print metadata line(s) for a single file argument."""
+def _render_single_file(target: Path, fields: list[str], *, force: bool) -> int:
+    """Print metadata line(s) for a single file argument; return exit code."""
     ext = target.suffix.lower().lstrip(".")
     if ext in CAMERA_VIDEO_EXTS or (ext in OTHER_VIDEO_EXTS and force):
         results = batch_mediainfo([target])
@@ -1022,10 +998,15 @@ def _render_single_file(target: Path, fields: list[str], *, force: bool) -> None
         results = batch_r3d([target])
     elif ext == "wav":
         results = batch_wav([target])
+    elif ext in OTHER_VIDEO_EXTS:
+        print(f"Skipped non-camera video container: {target.name} (use -f to analyze it)", file=sys.stderr)
+        return 1
     else:
-        return
+        print(f"Unsupported file type: {target.name}", file=sys.stderr)
+        return 1
     for t in results.values():
         print(_format_line(t, fields, audio=ext == "wav"))
+    return 0
 
 
 def _build_header(active_labels: list[tuple[str, str]]) -> str:
@@ -1176,13 +1157,11 @@ def main(argv: list[str] | None = None) -> int:
         signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 
     args = _build_parser().parse_args(argv)
-    raw_argv = argv if argv is not None else sys.argv[1:]
-    fields = _parse_fields(raw_argv)
+    fields = args.field_order or _DEFAULT_FIELDS[:]
     target = Path(args.path).resolve()
 
     if target.is_file():
-        _render_single_file(target, fields, force=args.force)
-        return 0
+        return _render_single_file(target, fields, force=args.force)
 
     if not target.is_dir():
         print(f"Error: '{target}' is not a valid file or directory.", file=sys.stderr)

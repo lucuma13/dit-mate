@@ -39,11 +39,13 @@ are given on the command line.
 from __future__ import annotations
 
 import argparse
+import functools
 import importlib.metadata
 import json
 import os
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -53,7 +55,8 @@ import pyperclip
 from dit_mate._internal import term
 from dit_mate._internal.binaries import invoke, run_capture
 from dit_mate._internal.config import CONFIG_DIR, bundled_data, load_or_seed_toml
-from dit_mate._internal.openers import open_in_default_app, open_in_editor
+from dit_mate._internal.openers import maybe_open_config
+from dit_mate._internal.utils import FieldOrderAction
 
 # -----------------------------------------------------------------------------
 # Version
@@ -163,26 +166,13 @@ def _load_roll_detection_config() -> dict:
     }
 
 
-_RD = _load_roll_detection_config()
-
-
-# ---------------------------------------------------------------------------
-# Preset editor helpers  (shared style with mkday)
-# ---------------------------------------------------------------------------
-
-
-def _open_presets_with_default_app() -> None:
-    """Open mrl_presets.toml in the OS default app for .toml files."""
-    if not PRESETS_PATH.exists():
-        sys.exit(f"❌  Presets config file not found: {PRESETS_PATH}")
-    open_in_default_app(PRESETS_PATH, label="presets config file")
-
-
-def _open_presets_in_editor() -> None:
-    """Open mrl_presets.toml in the user's preferred editor ($EDITOR/$VISUAL)."""
-    if not PRESETS_PATH.exists():
-        sys.exit(f"❌  Presets config file not found: {PRESETS_PATH}")
-    open_in_editor(PRESETS_PATH, label="presets config file")
+# Loaded lazily on first use (see _rd) rather than at import time, so that
+# -E/-O stay usable when the config file is invalid and --help/--version
+# never touch (or seed) the config at all.
+@functools.cache
+def _rd() -> dict:
+    """Return the roll-detection config, loading and caching it on first use."""
+    return _load_roll_detection_config()
 
 
 # ---------------------------------------------------------------------------
@@ -623,9 +613,10 @@ def _is_known_sibling(name: str) -> bool:
     known_siblings_contains (substring, case-insensitive) from mrl_presets.toml.
     """
     low = name.lower()
-    if low in _RD["ks_exact"]:
+    rd = _rd()
+    if low in rd["ks_exact"]:
         return True
-    return any(word in low for word in _RD["ks_contains"])
+    return any(word in low for word in rd["ks_contains"])
 
 
 def _is_known_parent(name: str) -> bool:
@@ -636,11 +627,12 @@ def _is_known_parent(name: str) -> bool:
     mrl_presets.toml.
     """
     low = name.lower()
-    if low in _RD["kp_exact"]:
+    rd = _rd()
+    if low in rd["kp_exact"]:
         return True
-    if _RD["kp_cam_prefix"].match(low) or _RD["kp_cam_suffix"].search(low):
+    if rd["kp_cam_prefix"].match(low) or rd["kp_cam_suffix"].search(low):
         return True
-    return any(p.match(low) for p in _RD["kp_flex"])
+    return any(p.match(low) for p in rd["kp_flex"])
 
 
 def _has_media(directory: Path) -> bool:
@@ -878,6 +870,11 @@ def validate_roll(clips: list[Clip]) -> list[Issue]:
 # Audio creation-date sorting (ffprobe)
 # ---------------------------------------------------------------------------
 
+#: Concurrent ffprobe subprocesses. Each probe is header-read + exit, so the
+#: bottleneck is process startup and volume latency, not CPU — a small pool
+#: gives most of the win without hammering slow external drives.
+_FFPROBE_WORKERS = 8
+
 # Match a sortable timestamp in any common form recorders write.
 _DATE_PREFIX_RE = re.compile(r"^(\d{4})[-:](\d{2})[-:](\d{2})(?:[ T](\d{2}):(\d{2}):(\d{2}))?")
 
@@ -905,9 +902,10 @@ def _normalize_timestamp(s: str) -> str:
 def audio_creation_times(wavs: list[Path]) -> dict[Path, str]:
     """Return ``{path: sortable_timestamp}`` for each WAV, via ffprobe.
 
-    Runs a single ``ffprobe`` call across all files (one JSON object per
-    file, separated by newlines). Probes BWF/iXML tags stored in the WAV
-    format container: ``creation_time``, ``origination_date``
+    ffprobe cannot batch multiple files into one JSON document, so one
+    subprocess is spawned per file — in parallel (see ``_FFPROBE_WORKERS``),
+    since the work is all subprocess wait time. Probes BWF/iXML tags stored
+    in the WAV format container: ``creation_time``, ``origination_date``
     + ``origination_time``, ``date``. The first usable value wins. Missing or
     unparsable values map to empty strings; the caller falls back to
     ``st_mtime``.
@@ -915,9 +913,6 @@ def audio_creation_times(wavs: list[Path]) -> dict[Path, str]:
     if not wavs:
         return {}
 
-    # ffprobe can probe multiple files in one invocation; each file
-    # produces one JSON object. We separate them with a record separator
-    # so we can split reliably even if tag values contain newlines.
     args = [
         "ffprobe",
         "-v",
@@ -927,33 +922,32 @@ def audio_creation_times(wavs: list[Path]) -> dict[Path, str]:
         "-show_entries",
         "format_tags=creation_time,origination_date,origination_time,date",
     ]
-    # ffprobe doesn't natively batch multiple files into one JSON array,
-    # so we call it once per file.
-    result: dict[Path, str] = {}
-    for p in wavs:
+
+    def _probe(p: Path) -> str:
         raw = run_capture([*args, str(p)])
+        if not raw.strip():
+            return ""
+        try:
+            tags = json.loads(raw).get("format", {}).get("tags", {})
+            # Normalise key case — ffprobe lowercases tag names.
+            tags = {k.lower(): v for k, v in tags.items()}
+        except (json.JSONDecodeError, AttributeError):
+            return ""
+        # Priority order: combine origination_date + origination_time
+        # (BWF spec fields) first, then creation_time (RF64/iXML).
+        orig_date = tags.get("origination_date", "")
+        orig_time = tags.get("origination_time", "")
         ts = ""
-        if raw.strip():
-            try:
-                data = json.loads(raw)
-                tags = data.get("format", {}).get("tags", {})
-                # Normalise key case — ffprobe lowercases tag names.
-                tags = {k.lower(): v for k, v in tags.items()}
-                # Priority order: combine origination_date + origination_time
-                # (BWF spec fields) first, then creation_time (RF64/iXML).
-                orig_date = tags.get("origination_date", "")
-                orig_time = tags.get("origination_time", "")
-                if orig_date:
-                    combined = f"{orig_date} {orig_time}".strip()
-                    ts = _normalize_timestamp(combined)
-                if not ts:
-                    ts = _normalize_timestamp(tags.get("creation_time", ""))
-                if not ts:
-                    ts = _normalize_timestamp(tags.get("date", ""))
-            except (json.JSONDecodeError, AttributeError):
-                pass
-        result[p] = ts
-    return result
+        if orig_date:
+            ts = _normalize_timestamp(f"{orig_date} {orig_time}".strip())
+        if not ts:
+            ts = _normalize_timestamp(tags.get("creation_time", ""))
+        if not ts:
+            ts = _normalize_timestamp(tags.get("date", ""))
+        return ts
+
+    with ThreadPoolExecutor(max_workers=min(_FFPROBE_WORKERS, len(wavs))) as pool:
+        return dict(zip(wavs, pool.map(_probe, wavs), strict=True))
 
 
 def _sort_key_for_audio(path: Path, embedded_ts: str) -> str:
@@ -984,8 +978,12 @@ def first_last_clips(clips: list[Clip]) -> tuple[str, str]:
 
     Rules:
       - If any video clips are present, only video clips are considered
-        for endpoints — sorted alphabetically by clip name. This avoids
-        a sidecar WAV becoming a misleading "last clip".
+        for endpoints — sorted by filesystem creation time (st_birthtime
+        on macOS, mtime fallback; see ``_video_ctime``). This avoids a
+        sidecar WAV becoming a misleading "last clip". Caveat: creation
+        times only reflect recording order if the copy tool preserved
+        them — clip names, being sequential, may disagree after a lossy
+        offload.
       - For audio-only rolls of WAV files, sort by creation date because
         alphabetical order can lie.
       - For audio-only rolls containing **any ZAX files** (Zaxcom MARF
@@ -1096,9 +1094,11 @@ def total_duration_seconds(clips: list[Clip]) -> float:
     One ffprobe subprocess is spawned per file using ``-show_entries
     format=duration``, which reads only the container header and exits
     immediately — fast even on large files over slow external volumes.
-    The concat-demuxer batching approach was tried previously but proved
-    unreliable: ffprobe treats the manifest as one virtual input so
-    per-file durations are not individually accessible.
+    Files are probed in parallel (see ``_FFPROBE_WORKERS``); the work is
+    all subprocess wait time. The concat-demuxer batching approach was
+    tried previously but proved unreliable: ffprobe treats the manifest
+    as one virtual input so per-file durations are not individually
+    accessible.
 
     Returns 0.0 if ffprobe is not installed, no video clips are present,
     or all files failed to parse.
@@ -1112,8 +1112,7 @@ def total_duration_seconds(clips: list[Clip]) -> float:
     if not video_files:
         return 0.0
 
-    total = 0.0
-    for f in video_files:
+    def _probe_duration(f: Path) -> float:
         raw = run_capture(
             [
                 "ffprobe",
@@ -1127,14 +1126,15 @@ def total_duration_seconds(clips: list[Clip]) -> float:
             ]
         )
         if not raw.strip():
-            continue
+            return 0.0
         try:
             dur = json.loads(raw).get("format", {}).get("duration", "")
-            if dur:
-                total += float(dur)
+            return float(dur) if dur else 0.0
         except (json.JSONDecodeError, ValueError, AttributeError):
-            continue
-    return total
+            return 0.0
+
+    with ThreadPoolExecutor(max_workers=min(_FFPROBE_WORKERS, len(video_files))) as pool:
+        return sum(pool.map(_probe_duration, video_files))
 
 
 def format_hms(seconds: float) -> str:
@@ -1150,8 +1150,8 @@ def format_hms(seconds: float) -> str:
 # ---------------------------------------------------------------------------
 
 
-def render_roll(clips: list[Clip], fields: list[str], roll_root: Path | None = None) -> str:
-    """Build the tab-separated value string for one roll (no roll label).
+def render_roll(clips: list[Clip], fields: list[str], roll_root: Path | None = None) -> list[str]:
+    """Build the ordered list of cell values for one roll (no roll label).
 
     ``fields`` is an ordered list of field keys to emit, derived from the
     order flags were given on the command line. Valid keys:
@@ -1187,7 +1187,7 @@ def render_roll(clips: list[Clip], fields: list[str], roll_root: Path | None = N
         "duration": get_duration,
         "size": lambda: f"{total_size_gb(clips, roll_root):.2f}",
     }
-    return "\t".join(emitters[f]() for f in fields if f in emitters)
+    return [emitters[f]() for f in fields if f in emitters]
 
 
 # ---------------------------------------------------------------------------
@@ -1195,20 +1195,6 @@ def render_roll(clips: list[Clip], fields: list[str], roll_root: Path | None = N
 # ---------------------------------------------------------------------------
 
 
-_FLAG_TO_FIELD = {
-    "-f": "first",
-    "--first-clip": "first",
-    "-l": "last",
-    "--last-clip": "last",
-    "-s": "size",
-    "--size": "size",
-    "-d": "duration",
-    "--duration": "duration",
-    "-c": "n",
-    "--clip-count": "n",
-    "-r": "roll",
-    "--roll": "roll",
-}
 _FIELD_TO_HEADER = {
     "first": "FIRST CLIP",
     "last": "LAST CLIP",
@@ -1235,14 +1221,24 @@ def _build_parser() -> argparse.ArgumentParser:
             "as -f -l -s -d -c. Column order follows the order flags are given."
         ),
     )
-    parser.add_argument("-f", "-F", "--first-clip", action="store_true", help="print first clip name")
-    parser.add_argument("-l", "-L", "--last-clip", action="store_true", help="print last clip name.")
-    parser.add_argument("-s", "-S", "--size", action="store_true", help=f"print total size in {_SIZE_UNIT}")
+    parser.set_defaults(field_order=[])
     parser.add_argument(
-        "-d", "-D", "--duration", action="store_true", help="print aggregated duration of video clips (HH:MM:SS)"
+        "-f", "-F", "--first-clip", action=FieldOrderAction, field="first", help="print first clip name"
     )
-    parser.add_argument("-c", "-C", "--clip-count", action="store_true", help="print the clip count")
-    parser.add_argument("-r", "-R", "--roll", action="store_true", help="print the roll name")
+    parser.add_argument("-l", "-L", "--last-clip", action=FieldOrderAction, field="last", help="print last clip name.")
+    parser.add_argument(
+        "-s", "-S", "--size", action=FieldOrderAction, field="size", help=f"print total size in {_SIZE_UNIT}"
+    )
+    parser.add_argument(
+        "-d",
+        "-D",
+        "--duration",
+        action=FieldOrderAction,
+        field="duration",
+        help="print aggregated duration of video clips (HH:MM:SS)",
+    )
+    parser.add_argument("-c", "-C", "--clip-count", action=FieldOrderAction, field="n", help="print the clip count")
+    parser.add_argument("-r", "-R", "--roll", action=FieldOrderAction, field="roll", help="print the roll name")
     parser.add_argument(
         "-E",
         "--edit-presets",
@@ -1265,32 +1261,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="camera roll directories (default: current directory)",
     )
     return parser
-
-
-def _parse_fields(raw_argv: list[str]) -> list[str]:
-    """Build the ordered field list from the argv token sequence.
-
-    Preserves the order flags were typed (this drives both render and
-    header) and expands combined POSIX short flags like ``-flsdc`` into
-    individual flags. Falls back to the default order when no field flags
-    were given.
-    """
-    SINGLE_SHORT_FLAG_LEN = 2  # len("-x"); anything longer is a combined bundle
-
-    fields: list[str] = []
-    seen: set[str] = set()
-    for token in raw_argv:
-        # Expand combined short flags like -flsdc into -f -l -s -d -c.
-        if token.startswith("-") and not token.startswith("--") and len(token) > SINGLE_SHORT_FLAG_LEN:
-            tokens = [f"-{ch}" for ch in token[1:]]
-        else:
-            tokens = [token]
-        for t in tokens:
-            f = _FLAG_TO_FIELD.get(t)
-            if f and f not in seen:
-                fields.append(f)
-                seen.add(f)
-    return fields or _DEFAULT_FIELDS[:]
 
 
 def _collect_rolls(args: argparse.Namespace) -> list[tuple[str, Path, list[Clip], list[Issue]]] | None:
@@ -1375,8 +1345,7 @@ def _raw_row(
     data_fields: list[str],
 ) -> list[str]:
     """Return ordered cell values (strings) for one roll."""
-    data_line = render_roll(clips, data_fields, roll_root)
-    data_vals = data_line.split("\t") if data_line else []
+    data_vals = render_roll(clips, data_fields, roll_root)
     di = 0
     cells: list[str] = []
     for f in fields:
@@ -1421,7 +1390,8 @@ def _copy_to_clipboard(text: str) -> None:
 
     Tries pyperclip first (handles macOS, Windows, Linux X11/Wayland,
     WSL). Falls back to direct subprocess calls (pbcopy / clip / xclip)
-    if pyperclip is not installed.
+    if pyperclip raises — e.g. no clipboard mechanism available on a
+    headless Linux box.
     """
     try:
         pyperclip.copy(text)
@@ -1526,18 +1496,12 @@ def main(argv: list[str] | None = None) -> int:
     """
     args = _build_parser().parse_args(argv)
 
-    # Open / edit presets and exit — these flags short-circuit everything else.
-    if args.open_presets:
-        _open_presets_with_default_app()
+    # -O/-E: open presets in the default app or $EDITOR, then exit —
+    # these flags short-circuit everything else.
+    if maybe_open_config(PRESETS_PATH, open_app=args.open_presets, edit=args.edit_presets, label="presets config file"):
         return 0
 
-    if args.edit_presets:
-        print(f"📋  Presets config file: {PRESETS_PATH}")
-        _open_presets_in_editor()
-        return 0
-
-    raw_argv = argv if argv is not None else sys.argv[1:]
-    fields = _parse_fields(raw_argv)
+    fields = args.field_order or _DEFAULT_FIELDS[:]
 
     rolls = _collect_rolls(args)
     if rolls is None:

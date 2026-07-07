@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 
-# xpandroll - Batch-rename rolls (or any files/folders) from a TSV dictionary
+# xpandroll - Batch-rename roll directories from a TSV dictionary
 
 """
 `xpandroll` reads a two-column TSV file located in the user configuration
 directory. The first column is the current name and the second column is the
-new name, then renames every matching entry inside one or more target directories.
+new name, then renames every matching directory (top-level only, files are
+ignored) inside one or more target directories.
 
 Each row maps one source name to one destination name. Rows starting with
 '#' are treated as comments and skipped. Blank lines are also skipped.
@@ -26,8 +27,8 @@ import sys
 from pathlib import Path
 
 from dit_mate._internal.config import CONFIG_DIR
-from dit_mate._internal.openers import open_in_default_app, open_in_editor
-from dit_mate._internal.paths import resolve_target_dirs
+from dit_mate._internal.openers import maybe_open_config
+from dit_mate._internal.utils import resolve_target_dirs
 
 # -----------------------------------------------------------------------------
 # Version
@@ -61,6 +62,23 @@ def ensure_tsv_exists() -> None:
             sys.exit(f"❌  Failed to create dictionary file: {exc}")
 
 
+def _validate_pair(src: str, dst: str, lineno: int, seen_src: dict[str, int], seen_dst: dict[str, int]) -> str | None:
+    """Return an error message for one (src, dst) pair, or None if it's valid.
+
+    Duplicate sources/destinations make the result order-dependent
+    (the second rename fails or clobbers) — reject them up front.
+    """
+    if not src:
+        return f"  Line {lineno}: source name is empty"
+    if not dst:
+        return f"  Line {lineno}: destination name is empty for source '{src}'"
+    if src in seen_src:
+        return f"  Line {lineno}: duplicate source '{src}' (already used on line {seen_src[src]})"
+    if dst in seen_dst:
+        return f"  Line {lineno}: duplicate destination '{dst}' (already used on line {seen_dst[dst]})"
+    return None
+
+
 def load_rename_dict() -> list[tuple[str, str]]:
     """Parse the two-column TSV file into an ordered list of (source, target) pairs.
 
@@ -71,6 +89,8 @@ def load_rename_dict() -> list[tuple[str, str]]:
 
     pairs: list[tuple[str, str]] = []
     errors: list[str] = []
+    seen_src: dict[str, int] = {}
+    seen_dst: dict[str, int] = {}
 
     try:
         text = TSV_PATH.read_text(encoding="utf-8")
@@ -86,12 +106,12 @@ def load_rename_dict() -> list[tuple[str, str]]:
             errors.append(f"  Line {lineno}: expected 2 tab-separated columns, got {len(cols)}: {raw!r}")
             continue
         src, dst = cols[0].strip(), cols[1].strip()
-        if not src:
-            errors.append(f"  Line {lineno}: source name is empty")
+        error = _validate_pair(src, dst, lineno, seen_src, seen_dst)
+        if error:
+            errors.append(error)
             continue
-        if not dst:
-            errors.append(f"  Line {lineno}: destination name is empty for source '{src}'")
-            continue
+        seen_src[src] = lineno
+        seen_dst[dst] = lineno
         pairs.append((src, dst))
 
     if errors:
@@ -111,11 +131,26 @@ def load_rename_dict() -> list[tuple[str, str]]:
 # ---------------------------------------------------------------------------
 
 
+def _is_case_only_rename(src_path: Path, dst_path: Path, src_name: str, dst_name: str) -> bool:
+    """True when src and dst are the same directory entry differing only in case.
+
+    On case-insensitive filesystems (macOS APFS/HFS+ defaults, Windows)
+    ``dst_path.exists()`` matches the source itself for a case-only rename
+    like ``roll_a → ROLL_A``. That rename is valid — ``os.rename`` handles
+    it in place — so it must not be reported as a destination collision.
+    """
+    if src_name == dst_name:
+        return False
+    try:
+        return src_path.samefile(dst_path)
+    except OSError:
+        return False
+
+
 def rename_in_directory(
     directory: Path,
     pairs: list[tuple[str, str]],
     dry_run: bool,
-    verbose: bool,
 ) -> tuple[list[str], list[str], list[str]]:
     """Apply rename pairs inside *directory* (non-recursive, top-level directories only).
 
@@ -133,7 +168,7 @@ def rename_in_directory(
             skipped.append(f"  ⏭   {src_name}  (directory not found in {directory})")
             continue
 
-        if dst_path.exists():
+        if dst_path.exists() and not _is_case_only_rename(src_path, dst_path, src_name, dst_name):
             errors.append(f"  ❌  {src_name} → {dst_name}  (destination already exists in {directory})")
             continue
 
@@ -147,23 +182,6 @@ def rename_in_directory(
                 errors.append(f"  ❌  {src_name} → {dst_name}  ({exc})")
 
     return renamed, skipped, errors
-
-
-# ---------------------------------------------------------------------------
-# CLI helpers (-E / -O open the TSV, mirroring mkday's preset file pattern)
-# ---------------------------------------------------------------------------
-
-
-def open_tsv_with_default_app() -> None:
-    """Open the TSV dictionary in the OS default app for text files."""
-    ensure_tsv_exists()
-    open_in_default_app(TSV_PATH, label="rename dictionary")
-
-
-def open_tsv_in_editor() -> None:
-    """Open the TSV dictionary in the user's preferred editor ($EDITOR/$VISUAL)."""
-    ensure_tsv_exists()
-    open_in_editor(TSV_PATH, label="rename dictionary")
 
 
 # ---------------------------------------------------------------------------
@@ -230,13 +248,11 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    if args.open_dict:
-        open_tsv_with_default_app()
-        return
-
-    if args.edit_dict:
-        print(f"📋  Rename dictionary: {TSV_PATH}")
-        open_tsv_in_editor()
+    # -O/-E: open the dictionary in the default app or $EDITOR, then exit.
+    # ensure_tsv_exists creates a blank dictionary on first use.
+    if maybe_open_config(
+        TSV_PATH, open_app=args.open_dict, edit=args.edit_dict, label="rename dictionary", ensure=ensure_tsv_exists
+    ):
         return
 
     # Check and parse file for execution runs
@@ -256,7 +272,7 @@ def main() -> None:
 
     for directory in directories:
         print(f"📂  {directory}")
-        renamed, skipped, errors = rename_in_directory(directory, pairs, dry_run=args.dry_run, verbose=args.verbose)
+        renamed, skipped, errors = rename_in_directory(directory, pairs, dry_run=args.dry_run)
 
         for line in renamed:
             print(line)
