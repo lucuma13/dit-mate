@@ -318,7 +318,7 @@ class TestMainHappyPath:
         with (
             patch.object(sys, "platform", "darwin"),
             patch.object(sys, "argv", ["lifsaver", "--verbose"]),
-            patch("os.getuid", return_value=0),
+            patch("os.getuid", return_value=0, create=True),
             patch.object(lifsaver, "get_disk_data", return_value=self.DISK_DATA),
             patch.object(lifsaver, "filter_target_partitions", return_value=["disk4s1", "disk5s2"]),
             patch.object(lifsaver, "execute_mount", return_value="ok") as mock_mount,
@@ -335,7 +335,7 @@ class TestMainHappyPath:
         with (
             patch.object(sys, "platform", "darwin"),
             patch.object(sys, "argv", ["lifsaver"]),
-            patch("os.getuid", return_value=0),
+            patch("os.getuid", return_value=0, create=True),
             patch.object(lifsaver, "get_disk_data", return_value=self.DISK_DATA),
             patch.object(lifsaver, "filter_target_partitions", return_value=[]) as mock_filter,
         ):
@@ -347,7 +347,7 @@ class TestMainHappyPath:
         with (
             patch.object(sys, "platform", "darwin"),
             patch.object(sys, "argv", ["lifsaver"]),
-            patch("os.getuid", return_value=0),
+            patch("os.getuid", return_value=0, create=True),
             patch.object(lifsaver, "get_disk_data", return_value=self.DISK_DATA),
             patch.object(lifsaver, "filter_target_partitions", return_value=[]),
             patch.object(lifsaver, "execute_mount") as mock_mount,
@@ -361,7 +361,7 @@ class TestMainHappyPath:
         with (
             patch.object(sys, "platform", "darwin"),
             patch.object(sys, "argv", ["lifsaver", "--verbose"]),
-            patch("os.getuid", return_value=501),
+            patch("os.getuid", return_value=501, create=True),
             patch("os.execvp") as mock_execvp,
             patch.object(lifsaver, "get_disk_data", return_value=self.DISK_DATA),
             patch.object(lifsaver, "filter_target_partitions", return_value=[]),
@@ -374,7 +374,7 @@ class TestMainHappyPath:
         with (
             patch.object(sys, "platform", "darwin"),
             patch.object(sys, "argv", ["lifsaver"]),
-            patch("os.getuid", return_value=0),
+            patch("os.getuid", return_value=0, create=True),
             patch("os.execvp") as mock_execvp,
             patch.object(lifsaver, "get_disk_data", return_value=self.DISK_DATA),
             patch.object(lifsaver, "filter_target_partitions", return_value=[]),
@@ -388,7 +388,7 @@ class TestMainHappyPath:
         with (
             patch.object(sys, "platform", "darwin"),
             patch.object(sys, "argv", ["lifsaver", "--dry-run"]),
-            patch("os.getuid", return_value=501),
+            patch("os.getuid", return_value=501, create=True),
             patch("os.execvp") as mock_execvp,
             patch.object(lifsaver, "get_disk_data", return_value=self.DISK_DATA),
             patch.object(lifsaver, "filter_target_partitions", return_value=[]),
@@ -878,7 +878,7 @@ class TestMainSummary:
         with (
             patch.object(sys, "platform", "darwin"),
             patch.object(sys, "argv", argv),
-            patch("os.getuid", return_value=0),
+            patch("os.getuid", return_value=0, create=True),
             patch.object(lifsaver, "get_disk_data", return_value={}),
             patch.object(lifsaver, "filter_target_partitions", return_value=["disk4s1"]),
             patch.object(lifsaver, "execute_mount", return_value=outcome),
