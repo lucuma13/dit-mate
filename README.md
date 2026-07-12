@@ -45,6 +45,11 @@ uv tool install dit-mate
 basicmeta --version; mkday --version; lifsaver --version; mrl --version; xpandroll --version
 ```
 
+#### Alternative (macOS only)
+
+Install with [Homebrew](https://brew.sh/): `brew install lucuma13/dit/dit-mate`
+
+
 ### 📖 Usage examples
 
 Check the essential metadata of multiple camera rolls:
