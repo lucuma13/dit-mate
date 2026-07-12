@@ -123,3 +123,6 @@ lint.per-file-ignores."tests/*" = [
 
 [tool.pytest]
 ini_options.addopts = "--strict-markers --cov=src --cov-branch --cov-report=term-missing --cov-report=xml"
+
+[tool.dit-mate]
+homebrew.dependencies = [ "exiftool", "ffmpeg", "media-info" ]
