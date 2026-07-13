@@ -1,4 +1,5 @@
-"""Terminal colour / ANSI helpers and the shared palette for the CLIs.
+"""
+Terminal colour / ANSI helpers and the shared palette for the CLIs.
 
 The palette below is the single source of truth for colour codes, so every
 tool renders the same hues. Each module decides *when* to emit them (per
@@ -22,7 +23,8 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def enable_ansi_on_windows() -> bool:
-    """Enable ANSI escape processing on Windows 10+ consoles; no-op on Unix.
+    """
+    Enable ANSI escape processing on Windows 10+ consoles; no-op on Unix.
 
     On Windows we flip ``ENABLE_VIRTUAL_TERMINAL_PROCESSING`` (0x0004) on the
     stdout handle so VT-aware terminals render colour. Older Windows / non-VT
@@ -49,7 +51,17 @@ def enable_ansi_on_windows() -> bool:
 
 
 def supports_color(stream: TextIO) -> bool:
-    """Return True if *stream* is a TTY and ANSI is available (so emit colour)."""
+    """
+    Return True if colour should be emitted on *stream*.
+
+    Follows the NO_COLOR / FORCE_COLOR conventions (no-color.org): a non-empty
+    NO_COLOR disables colour, else a non-empty FORCE_COLOR forces it, else
+    colour is used when *stream* is a TTY and ANSI is available.
+    """
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR"):
+        return True
     return stream.isatty() and enable_ansi_on_windows()
 
 
