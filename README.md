@@ -42,7 +42,7 @@ uv tool install dit-mate
 3. Test the installation (if the command is not recognised try `uv tool update-shell` and restart your terminal):
 
 ```
-basicmeta --version; mkday --version; lifsaver --version; mrl --version; xpandroll --version
+dit-mate --help
 ```
 
 #### Alternative (macOS only)
