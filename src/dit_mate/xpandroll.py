@@ -152,12 +152,16 @@ def rename_in_directory(
     directory: Path,
     pairs: list[tuple[str, str]],
     dry_run: bool,
-) -> tuple[list[str], list[str], list[str]]:
-    """Apply rename pairs inside *directory* (non-recursive, top-level directories only).
+) -> tuple[list[str], list[str], list[str], list[str]]:
+    """
+    Apply rename pairs inside directory (non-recursive, top-level directories
+    only).
 
-    Returns three lists: renamed, skipped, errors — each as human-readable strings.
+    Returns four lists: renamed, already renamed, skipped, errors — each as
+    human-readable strings.
     """
     renamed: list[str] = []
+    already: list[str] = []
     skipped: list[str] = []
     errors: list[str] = []
 
@@ -166,7 +170,10 @@ def rename_in_directory(
         dst_path = directory / dst_name
 
         if not src_path.is_dir():
-            skipped.append(f"  ⏭   {src_name}  (directory not found in {directory})")
+            if dst_path.is_dir():
+                already.append(f"  ⏭   {src_name} → {dst_name}  (already renamed in {directory})")
+            else:
+                skipped.append(f"  ⏭   {src_name}  (directory not found in {directory})")
             continue
 
         if dst_path.exists() and not _is_case_only_rename(src_path, dst_path, src_name, dst_name):
@@ -182,7 +189,7 @@ def rename_in_directory(
             except OSError as exc:
                 errors.append(f"  ❌  {src_name} → {dst_name}  ({exc})")
 
-    return renamed, skipped, errors
+    return renamed, already, skipped, errors
 
 
 # ---------------------------------------------------------------------------
@@ -216,7 +223,7 @@ def build_parser() -> argparse.ArgumentParser:
         "-v",
         "--verbose",
         action="store_true",
-        help="also print skipped entries (not found in directory)",
+        help="also print skipped entries (not found in directory, or already renamed)",
     )
     parser.add_argument(
         "-E",
@@ -269,30 +276,41 @@ def _main() -> None:
     mode_label = "[DRY RUN] " if args.dry_run else ""
     print(f"\n🎬  xpandroll {mode_label}— {len(pairs)} pairs from {TSV_PATH.name}\n")
 
-    total_renamed = total_skipped = total_errors = 0
+    total_renamed = total_already = total_skipped = total_errors = 0
 
     for directory in directories:
         print(f"📂  {directory}")
-        renamed, skipped, errors = rename_in_directory(directory, pairs, dry_run=args.dry_run)
+        renamed, already, skipped, errors = rename_in_directory(directory, pairs, dry_run=args.dry_run)
 
         for line in renamed:
             print(line)
         if args.verbose:
+            for line in already:
+                print(line)
             for line in skipped:
                 print(line)
         for line in errors:
             print(line)
 
         total_renamed += len(renamed)
+        total_already += len(already)
         total_skipped += len(skipped)
         total_errors += len(errors)
 
     # Summary
     verb = "Would rename" if args.dry_run else "Renamed"
+    reasons = [(total_skipped, "not found"), (total_already, "already renamed")]
+    present = [(count, label) for count, label in reasons if count]
+    if len(present) > 1:
+        breakdown = "  (" + ", ".join(f"{count} {label}" for count, label in present) + ")"
+    elif present:
+        breakdown = f"  ({present[0][1]})"
+    else:
+        breakdown = ""
     print(
         f"\n{'─' * 48}\n"
         f"  {verb}:  {total_renamed}\n"
-        f"  Skipped: {total_skipped}  (not found)\n"
+        f"  Skipped: {total_already + total_skipped}{breakdown}\n"
         f"  Errors:  {total_errors}\n"
     )
 
