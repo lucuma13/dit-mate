@@ -7,9 +7,8 @@ macOS Tahoe / LIFS compatibility: prefers `diskutil mount` over raw mount
 binaries, which are increasingly sandbox-restricted in Tahoe's security model.
 
 Usage:
-    sudo lifsaver           # normal run
-    sudo lifsaver --verbose # show raw stderr on failures
-    lifsaver --dry-run      # preview only, no writes
+    lifsaver           # scan (read-only), confirm, then mount via sudo
+    lifsaver --verbose # show full mount sequence and raw stderr
 """
 
 import argparse
@@ -164,7 +163,7 @@ def get_partition_fs_type(dev_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def filter_target_partitions(disk_data: dict) -> list[str]:
+def filter_target_partitions(disk_data: dict, verbose: bool = False) -> list[str]:
     """
     Walk the plist returned by `diskutil list -plist` and return device
     identifiers (e.g. ['disk4s1']) that are:
@@ -217,7 +216,8 @@ def filter_target_partitions(disk_data: dict) -> list[str]:
 
             # Safety gate: skip anything already in the mount table
             if dev_path in active_mounts:
-                print(f"  Skipping {dev_id} — already mounted.")
+                if verbose:
+                    print(f"  Skipping {dev_id} — already mounted.")
                 continue
 
             targets.append(dev_id)
@@ -308,7 +308,30 @@ def _run_raw_mount(dev_id: str, fs_type: str, verbose: bool) -> bool:
     return False
 
 
-def execute_mount(dev_id: str, dry_run: bool = False, verbose: bool = False) -> MountOutcome:
+def _attempt_mounts(dev_id: str, fs_type: str, verbose: bool) -> bool:
+    """
+    Try `diskutil mount` first (preferred; handles LIFS sandboxing), then
+    fall back to raw mount binaries.  Verifies against the live mount table
+    after each attempt.
+    """
+    if verbose:
+        print("  Attempting diskutil mount...")
+    if _run_diskutil_mount(dev_id, verbose) and is_currently_mounted(dev_id):
+        if verbose:
+            print(f"  SUCCESS via diskutil → {_find_mount_point(dev_id) or '(see /Volumes)'}")
+        return True
+
+    if verbose:
+        print("  diskutil mount failed; falling back to raw mount binaries...")
+    if _run_raw_mount(dev_id, fs_type, verbose) and is_currently_mounted(dev_id):
+        if verbose:
+            print(f"  SUCCESS via raw mount → /Volumes/Camera_Data_{dev_id}")
+        return True
+
+    return False
+
+
+def execute_mount(dev_id: str, verbose: bool = False) -> MountOutcome:
     """
     Orchestrate the full mount sequence for a single device identifier.
 
@@ -318,7 +341,8 @@ def execute_mount(dev_id: str, dry_run: bool = False, verbose: bool = False) -> 
       3. Try `diskutil mount` — preferred; handles LIFS sandboxing.
       4. Fall back to raw mount binaries if diskutil fails.
     """
-    print(f"\nTarget: /dev/{dev_id}")
+    if verbose:
+        print(f"\nTarget: /dev/{dev_id}")
 
     # Re-query live mount table immediately before acting (race guard)
     if is_currently_mounted(dev_id):
@@ -332,24 +356,10 @@ def execute_mount(dev_id: str, dry_run: bool = False, verbose: bool = False) -> 
         return "skip"
 
     fs_type = get_partition_fs_type(dev_id)
-    if fs_type:
+    if verbose and fs_type:
         print(f"  Detected filesystem: {fs_type}")
 
-    if dry_run:
-        print(f"  DRY-RUN: would attempt to mount /dev/{dev_id}")
-        return "ok"
-
-    # --- Attempt 1: diskutil mount (Tahoe-safe) ---
-    print("  Attempting diskutil mount...")
-    if _run_diskutil_mount(dev_id, verbose) and is_currently_mounted(dev_id):
-        mount_point = _find_mount_point(dev_id)
-        print(f"  SUCCESS via diskutil → {mount_point or '(see /Volumes)'}")
-        return "ok"
-
-    # --- Attempt 2: raw mount binaries ---
-    print("  diskutil mount failed; falling back to raw mount binaries...")
-    if _run_raw_mount(dev_id, fs_type, verbose) and is_currently_mounted(dev_id):
-        print(f"  SUCCESS via raw mount → /Volumes/Camera_Data_{dev_id}")
+    if _attempt_mounts(dev_id, fs_type, verbose):
         return "ok"
 
     print(f"  CRITICAL ERROR: All mount strategies rejected /dev/{dev_id}")
@@ -387,14 +397,9 @@ def parse_args() -> argparse.Namespace:
         version=f"{__version__}",
     )
     parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="print what would be mounted without touching anything.",
-    )
-    parser.add_argument(
         "--verbose",
         action="store_true",
-        help="show raw stderr from mount commands.",
+        help="show the full mount sequence and raw stderr from mount commands.",
     )
     return parser.parse_args()
 
@@ -416,40 +421,59 @@ def check_platform() -> None:
         sys.exit(1)
 
 
+def _preflight_and_escalate() -> None:
+    """
+    Non-root pre-flight: scanning is read-only, so find the targets first
+    and describe them before escalating. sudo's own password prompt acts as
+    the confirmation — Ctrl+C or a wrong password there aborts with nothing
+    mounted.
+    """
+    targets = filter_target_partitions(get_disk_data())
+    if not targets:
+        print("No stalled or unmounted camera data volumes detected.")
+        return
+    count = len(targets)
+    noun = "volume" if count == 1 else "volumes"
+    print(
+        f"Would mount {count} stalled {noun}. If you want to continue, please enter your password below "
+        "(otherwise Ctrl+C to abort, or quit this window):"
+    )
+    os.execvp("sudo", ["sudo", sys.executable, *sys.argv])
+
+
 def _main() -> None:
     check_platform()
     args = parse_args()
 
-    # Re-exec with sudo, preserving all original arguments.
-    # Dry-run only performs read-only queries, so it never needs root.
-    if os.getuid() != 0 and not args.dry_run:
-        print("Root access required. Re-running with sudo...")
-        os.execvp("sudo", ["sudo", sys.executable, *sys.argv])
+    # Running `sudo lifsaver` directly skips the confirmation prompt —
+    # the sudo re-exec in the pre-flight would otherwise ask twice.
+    if os.getuid() != 0:
+        _preflight_and_escalate()
+        return
 
-    print(SEPARATOR)
-    mode = " [DRY-RUN]" if args.dry_run else ""
-    print(f"Camera volume mount sequence{mode}")
-    print(SEPARATOR)
+    if args.verbose:
+        print(SEPARATOR)
+        print("Camera volume mount sequence")
+        print(SEPARATOR)
 
     disk_data = get_disk_data()
-    targets = filter_target_partitions(disk_data)
+    targets = filter_target_partitions(disk_data, verbose=args.verbose)
 
     if not targets:
         print("No stalled or unmounted camera data volumes detected.")
-        print(SEPARATOR)
+        if args.verbose:
+            print(SEPARATOR)
         return
 
-    print(f"Found {len(targets)} candidate volume(s): {', '.join(targets)}")
+    if args.verbose:
+        print(f"Found {len(targets)} candidate volume(s): {', '.join(targets)}")
 
     results = {"ok": 0, "fail": 0, "skip": 0}
     for dev_id in targets:
-        outcome = execute_mount(dev_id, dry_run=args.dry_run, verbose=args.verbose)
+        outcome = execute_mount(dev_id, verbose=args.verbose)
         results[outcome] += 1
-        print(SEPARATOR)
-
-    if args.dry_run:
-        print(f"Done — {results['ok']} mountable, {results['skip']} skipped.")
-        return
+        if args.verbose:
+            print(SEPARATOR)
 
     print(f"Done — {results['ok']} mounted, {results['fail']} failed, {results['skip']} skipped.")
     if results["fail"]:
