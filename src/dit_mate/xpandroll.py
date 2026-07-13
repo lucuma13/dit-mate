@@ -29,6 +29,7 @@ from pathlib import Path
 from dit_mate._internal.config import CONFIG_DIR
 from dit_mate._internal.openers import maybe_open_config
 from dit_mate._internal.utils import resolve_target_dirs
+from dit_mate.update_checker import run_with_update_check
 
 # -----------------------------------------------------------------------------
 # Version
@@ -244,7 +245,7 @@ def build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
+def _main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
@@ -297,6 +298,10 @@ def main() -> None:
 
     if total_errors:
         sys.exit(1)
+
+
+def main() -> None:
+    run_with_update_check("dit-mate", __version__, _main)
 
 
 if __name__ == "__main__":

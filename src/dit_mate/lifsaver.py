@@ -23,6 +23,8 @@ import sys
 from pathlib import Path
 from typing import Literal
 
+from dit_mate.update_checker import run_with_update_check
+
 # -----------------------------------------------------------------------------
 # Version
 # -----------------------------------------------------------------------------
@@ -414,7 +416,7 @@ def check_platform() -> None:
         sys.exit(1)
 
 
-def main() -> None:
+def _main() -> None:
     check_platform()
     args = parse_args()
 
@@ -452,6 +454,10 @@ def main() -> None:
     print(f"Done — {results['ok']} mounted, {results['fail']} failed, {results['skip']} skipped.")
     if results["fail"]:
         sys.exit(1)
+
+
+def main() -> None:
+    run_with_update_check("dit-mate", __version__, _main)
 
 
 if __name__ == "__main__":

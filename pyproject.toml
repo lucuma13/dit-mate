@@ -53,12 +53,14 @@ classifiers = [
 ]
 dependencies = [
   "humanize>=4.16",
+  "packaging>=25",
   "platformdirs>=4.10",
   "pyperclip>=1.11",
   "xxhash>=3.8.1",
 ]
 urls.Homepage = "https://github.com/lucuma13/dit-mate"
 scripts.basicmeta = "dit_mate.basicmeta:main"
+scripts.dit-mate = "dit_mate.cli:main"
 scripts.lifsaver = "dit_mate.lifsaver:main"
 scripts.mkday = "dit_mate.mkday:main"
 scripts.mrl = "dit_mate.mrl:main"

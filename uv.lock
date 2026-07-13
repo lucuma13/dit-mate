@@ -124,6 +124,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "humanize" },
+    { name = "packaging" },
     { name = "platformdirs" },
     { name = "pyperclip" },
     { name = "xxhash" },
@@ -142,6 +143,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "humanize", specifier = ">=4.16" },
+    { name = "packaging", specifier = ">=25.0" },
     { name = "platformdirs", specifier = ">=4.10" },
     { name = "pyperclip", specifier = ">=1.11" },
     { name = "xxhash", specifier = ">=3.8.1" },

@@ -57,6 +57,7 @@ from dit_mate._internal.binaries import invoke, run_capture
 from dit_mate._internal.config import CONFIG_DIR, bundled_data, load_or_seed_toml
 from dit_mate._internal.openers import maybe_open_config
 from dit_mate._internal.utils import FieldOrderAction
+from dit_mate.update_checker import run_with_update_check
 
 # -----------------------------------------------------------------------------
 # Version
@@ -1476,7 +1477,7 @@ def _render_rolls(
     return 1 if had_issues else 0
 
 
-def main(argv: list[str] | None = None) -> int:
+def _main(argv: list[str] | None = None) -> int:
     """Parse command-line arguments and emit one rushes-log line per roll.
 
     The flow is:
@@ -1537,6 +1538,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     return _render_rolls(valid_rolls, fields, multi=len(rolls) > 1, had_issues=had_issues)
+
+
+def main(argv: list[str] | None = None) -> int:
+    return run_with_update_check("dit-mate", __version__, lambda: _main(argv))
 
 
 if __name__ == "__main__":

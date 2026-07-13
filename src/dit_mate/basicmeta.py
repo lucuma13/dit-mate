@@ -33,6 +33,7 @@ from pathlib import Path
 from dit_mate._internal import term
 from dit_mate._internal.binaries import run_capture
 from dit_mate._internal.utils import FieldOrderAction
+from dit_mate.update_checker import run_with_update_check
 
 # -----------------------------------------------------------------------------
 # Version
@@ -1137,7 +1138,7 @@ def _print_summary(all_raw: list[tuple[str, str, str, str]], fields: list[str]) 
     print(f"\n\U0001f440 Manual check required, some files have a different {summary_fields}")
 
 
-def main(argv: list[str] | None = None) -> int:
+def _main(argv: list[str] | None = None) -> int:
     """CLI entry point.
 
     Args:
@@ -1170,6 +1171,10 @@ def main(argv: list[str] | None = None) -> int:
     all_raw = _emit_directory(target, fields, force=args.force)
     _print_summary(all_raw, fields)
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    return run_with_update_check("dit-mate", __version__, lambda: _main(argv))
 
 
 if __name__ == "__main__":
