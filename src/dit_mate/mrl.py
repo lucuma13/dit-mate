@@ -855,10 +855,7 @@ def validate_roll(clips: list[Clip]) -> list[Issue]:
                 anchor=anchor,
                 message=(
                     f"contains clips from multiple recording sessions — "
-                    f"different filename signatures detected: {summary}. "
-                    f"Card was likely used in two devices or two sessions "
-                    f"without reformatting. First example of the minority "
-                    f"group: {anchor}"
+                    f"different filename signatures detected: {summary}."
                 ),
             )
         )
@@ -1253,6 +1250,11 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="open_presets",
         help="open mrl_presets.toml in the system default app for text files",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="emit output for rolls with validation warnings instead of skipping them (warnings still print to stderr)",
+    )
     parser.add_argument("--version", action="version", version=f"{__version__}")
     parser.add_argument(
         "paths",
@@ -1303,7 +1305,7 @@ def _collect_rolls(args: argparse.Namespace) -> list[tuple[str, Path, list[Clip]
     return rolls
 
 
-def _report_broken_rolls(rolls: list[tuple[str, Path, list[Clip], list[Issue]]]) -> bool:
+def _report_broken_rolls(rolls: list[tuple[str, Path, list[Clip], list[Issue]]], *, force: bool = False) -> bool:
     """Print stderr diagnostics for every roll with issues.
 
     Done before stdout so the user sees warnings first when stderr and
@@ -1313,14 +1315,19 @@ def _report_broken_rolls(rolls: list[tuple[str, Path, list[Clip], list[Issue]]])
     for name, _root, _clips, issues in rolls:
         if not issues:
             continue
+        if had_issues:
+            print(file=sys.stderr)  # blank line between broken-roll blocks
         had_issues = True
         for issue in issues:
             print(f"Warning: roll '{name}' — {issue.message}", file=sys.stderr)
-        print(
-            f"Warning: roll '{name}' has issues that need investigation; "
-            f"skipping output for this roll. Please check it manually.",
-            file=sys.stderr,
-        )
+        if not force:
+            print(file=sys.stderr)
+            print(
+                "Skipping output for this roll. Please check it manually, then override with --force.",
+                file=sys.stderr,
+            )
+    if had_issues:
+        print(file=sys.stderr)  # blank line before the output table
     return had_issues
 
 
@@ -1485,6 +1492,8 @@ def main(argv: list[str] | None = None) -> int:
       4. Print stderr diagnostics for every broken roll, then drop
          broken rolls from stdout output entirely (so partial values
          like size or count don't end up pasted into the log).
+         ``--force`` overrides the drop: broken rolls are emitted
+         anyway (warnings still print) and the exit code stays 0.
       5. Render the surviving rolls. Always tab-separated values,
          space-padded so columns align visually in the terminal.
          Also copies strict TSV (no padding) to the system clipboard.
@@ -1510,12 +1519,18 @@ def main(argv: list[str] | None = None) -> int:
         print("Error: no media files found under any input path.", file=sys.stderr)
         return 1
 
-    had_issues = _report_broken_rolls(rolls)
+    had_issues = _report_broken_rolls(rolls, force=args.force)
 
     # Drop broken rolls from stdout. Even if -s and -n would technically
     # be unaffected by the issue, emitting any partial value risks the
     # DIT pasting it into the log without realizing the roll is suspect.
-    valid_rolls = [(n, root, c) for (n, root, c, i) in rolls if not i]
+    # --force keeps them in: the user has investigated and accepted the
+    # warnings, so output is emitted and the exit code stays 0.
+    if args.force:
+        valid_rolls = [(n, root, c) for (n, root, c, _i) in rolls]
+        had_issues = False
+    else:
+        valid_rolls = [(n, root, c) for (n, root, c, i) in rolls if not i]
     if not valid_rolls:
         # Every roll was broken. Stderr already explained why; just
         # exit non-zero so calling shells/scripts notice.
