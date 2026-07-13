@@ -8,7 +8,7 @@ sites don't repeat them.
 
 import os
 import subprocess
-from collections.abc import Iterator
+from collections.abc import Generator
 
 # On Windows, child processes default to opening their own console window —
 # annoying for a CLI tool. CREATE_NO_WINDOW (0x08000000) suppresses that without
@@ -54,7 +54,7 @@ def run_capture(cmd: list[str]) -> str:
         return ""
 
 
-def stream_lines(cmd: list[str]) -> Iterator[str]:
+def stream_lines(cmd: list[str]) -> Generator[str, None, None]:
     """
     Run *cmd* and yield its stdout line by line as the process emits them.
 

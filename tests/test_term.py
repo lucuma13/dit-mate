@@ -29,5 +29,5 @@ def test_supports_color_follows_no_color_and_force_color(monkeypatch, env, tty, 
     for var, value in env.items():
         monkeypatch.setenv(var, value)
     monkeypatch.setattr(term, "enable_ansi_on_windows", lambda: True)
-    stream = cast(TextIO, SimpleNamespace(isatty=lambda: tty))  # only isatty() is used
+    stream = cast("TextIO", SimpleNamespace(isatty=lambda: tty))  # only isatty() is used
     assert term.supports_color(stream) is expected

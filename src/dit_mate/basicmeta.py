@@ -27,7 +27,7 @@ import re
 import shutil
 import signal
 import sys
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Generator, Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -498,7 +498,7 @@ def _stream_exiftool_rows(
     paths: list[Path],
     args: list[str],
     build_row: Callable[[dict[str, str], Path], _MetaRow],
-) -> Iterator[tuple[Path, _MetaRow]]:
+) -> Generator[tuple[Path, _MetaRow], None, None]:
     """
     Run one batched exiftool call over *paths* and yield rows progressively.
 
@@ -581,7 +581,7 @@ def _r3d_row(rec: dict[str, str], p: Path) -> _MetaRow:
     return (fps, res, date, sn, name)
 
 
-def stream_r3d(paths: list[Path]) -> Iterator[tuple[Path, _MetaRow]]:
+def stream_r3d(paths: list[Path]) -> Generator[tuple[Path, _MetaRow], None, None]:
     """
     Process all R3D files in a single exiftool call, streaming rows.
 

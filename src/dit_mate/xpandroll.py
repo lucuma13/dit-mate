@@ -252,6 +252,19 @@ def build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 
 
+def _print_summary(*, dry_run: bool, renamed: int, already: int, skipped: int, errors: int) -> None:
+    verb = "Would rename" if dry_run else "Renamed"
+    reasons = [(skipped, "not found"), (already, "already renamed")]
+    present = [(count, label) for count, label in reasons if count]
+    if len(present) > 1:
+        breakdown = "  (" + ", ".join(f"{count} {label}" for count, label in present) + ")"
+    elif present:
+        breakdown = f"  ({present[0][1]})"
+    else:
+        breakdown = ""
+    print(f"\n{'─' * 48}\n  {verb}:  {renamed}\n  Skipped: {already + skipped}{breakdown}\n  Errors:  {errors}\n")
+
+
 def _main() -> None:
     parser = build_parser()
     args = parser.parse_args()
@@ -297,21 +310,12 @@ def _main() -> None:
         total_skipped += len(skipped)
         total_errors += len(errors)
 
-    # Summary
-    verb = "Would rename" if args.dry_run else "Renamed"
-    reasons = [(total_skipped, "not found"), (total_already, "already renamed")]
-    present = [(count, label) for count, label in reasons if count]
-    if len(present) > 1:
-        breakdown = "  (" + ", ".join(f"{count} {label}" for count, label in present) + ")"
-    elif present:
-        breakdown = f"  ({present[0][1]})"
-    else:
-        breakdown = ""
-    print(
-        f"\n{'─' * 48}\n"
-        f"  {verb}:  {total_renamed}\n"
-        f"  Skipped: {total_already + total_skipped}{breakdown}\n"
-        f"  Errors:  {total_errors}\n"
+    _print_summary(
+        dry_run=args.dry_run,
+        renamed=total_renamed,
+        already=total_already,
+        skipped=total_skipped,
+        errors=total_errors,
     )
 
     if total_errors:
