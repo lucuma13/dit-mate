@@ -8,6 +8,7 @@ sites don't repeat them.
 
 import os
 import subprocess
+from collections.abc import Iterator
 
 # On Windows, child processes default to opening their own console window —
 # annoying for a CLI tool. CREATE_NO_WINDOW (0x08000000) suppresses that without
@@ -51,3 +52,34 @@ def run_capture(cmd: list[str]) -> str:
         return invoke(cmd, capture_output=True, text=True).stdout
     except (FileNotFoundError, OSError, subprocess.SubprocessError):
         return ""
+
+
+def stream_lines(cmd: list[str]) -> Iterator[str]:
+    """
+    Run *cmd* and yield its stdout line by line as the process emits them.
+
+    Streaming counterpart to ``run_capture`` with the same "never raise"
+    contract: on spawn failure (tool not found, OS error) the iterator simply
+    yields nothing. stderr is discarded. If the consumer abandons the iterator
+    early the child is terminated; in every case the process is reaped before
+    the generator finishes.
+    """
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            creationflags=_CREATION_FLAGS,
+        )
+    except (FileNotFoundError, OSError, subprocess.SubprocessError):
+        return
+    try:
+        if proc.stdout is not None:
+            yield from proc.stdout
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+        if proc.stdout is not None:
+            proc.stdout.close()
+        proc.wait()

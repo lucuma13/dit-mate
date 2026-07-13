@@ -27,11 +27,12 @@ import re
 import shutil
 import signal
 import sys
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
 from dit_mate._internal import term
-from dit_mate._internal.binaries import run_capture
+from dit_mate._internal.binaries import run_capture, stream_lines
 from dit_mate._internal.utils import FieldOrderAction
 from dit_mate.update_checker import run_with_update_check
 
@@ -49,7 +50,8 @@ except importlib.metadata.PackageNotFoundError:  # pragma: no cover
 # ---------------------------------------------------------------------------
 
 #: One parsed media row: ``(fps, resolution, date, serial_number, name)``.
-#: Returned per file by the ``batch_*`` functions and consumed by ``_format_line``.
+#: Returned per file by ``batch_mediainfo`` and the ``stream_*`` generators,
+#: consumed by ``_format_line``.
 _MetaRow = tuple[str, str, str, str, str]
 
 #: Extensions that are *always* parsed (genuine camera containers).
@@ -442,52 +444,44 @@ def _render_line(vals: _FieldValues, name: str, fields: list[str], *, audio: boo
 
 
 # ---------------------------------------------------------------------------
-# Exiftool batched output parsing
+# Exiftool streaming output parsing
 # ---------------------------------------------------------------------------
 
 
-def _split_exiftool_batches(out: str, n_files: int) -> list[dict[str, str]]:
-    """Parse exiftool's multi-file output into one record per file.
+def _stream_exiftool_records(cmd: list[str]) -> Iterator[dict[str, str]]:
+    """
+    Run exiftool and yield one record per file as its output block completes.
 
-    When exiftool processes multiple files in a single invocation, it
-    separates each file's output with a header line of the form::
+    With two or more input files exiftool separates each file's output with a
+    header line of the form::
 
         ======== /path/to/the/file.ext
 
-    For a *single* file, no such header is emitted — the output is just
-    the bare key/value lines. We have to handle both shapes.
+    A record is therefore complete as soon as the *next* header (or EOF)
+    arrives, which lets records stream out while exiftool is still working
+    through the rest of its argument list. The header path is stashed under the
+    synthetic key ``"_file"`` so the caller can map records back to inputs.
+
+    For a *single* file no header is emitted — the output is just the bare
+    key/value lines, yielded as one ``"_file"``-less record at EOF.
 
     Args:
-        out: raw exiftool stdout.
-        n_files: number of files that were passed to exiftool. Used to
-            distinguish the "no header" single-file case from the
-            "headered" multi-file case.
+        cmd: full exiftool argv (binary, flags, tags, paths).
 
-    Returns:
-        A list of records. Each record is a flat ``{key: value}`` dict
-        of the metadata fields exiftool emitted for that file. When a
-        ``======== <path>`` header is present, the path is stored under
-        the synthetic key ``"_file"`` so the caller can map records back
-        to inputs.
+    Yields:
+        Flat ``{tag: value}`` records, one per file, in the order exiftool
+        processed them (its argument order).
     """
-    if n_files <= 1:
-        # Single-file path: no header markers, just plain key:value lines.
-        rec = _parse_exiftool_block(out)
-        return [rec] if rec else []
-
-    records: list[dict[str, str]] = []
     cur: dict[str, str] = {}
-    for line in out.splitlines():
+    for line in stream_lines(cmd):
         if line.startswith("======== "):
-            # Start a new record. Flush the previous one if it had any
-            # content. The first iteration's "cur" is empty so nothing
-            # is flushed prematurely.
+            # A new header completes the previous record. The first
+            # iteration's "cur" is empty so nothing is flushed prematurely.
             if cur:
-                records.append(cur)
-            # Stash the file path under a private key so we can match
-            # records to input paths later. exiftool sometimes adds a
-            # trailing colon to the path on this line — strip generously.
-            cur = {"_file": line[len("======== ") :].rstrip(":").strip()}
+                yield cur
+            # exiftool sometimes adds a trailing colon to the path on this
+            # line — strip generously.
+            cur = {"_file": line[len("======== ") :].strip().rstrip(":")}
         elif ":" in line:
             # exiftool with -s2 emits "Tag: value" lines (no padding).
             # ``partition`` cleanly splits on the *first* colon only,
@@ -495,37 +489,107 @@ def _split_exiftool_batches(out: str, n_files: int) -> list[dict[str, str]]:
             # (e.g. timestamps like "2024:06:15 10:30:00").
             k, _, v = line.partition(":")
             cur[k.strip()] = v.strip()
-    # Don't forget the final record after the loop ends.
+    # Don't forget the final record after EOF.
     if cur:
-        records.append(cur)
-    return records
+        yield cur
 
 
-def _parse_exiftool_block(text: str) -> dict[str, str]:
-    """Parse a single exiftool output block (no ``========`` headers).
+def _stream_exiftool_rows(
+    paths: list[Path],
+    args: list[str],
+    build_row: Callable[[dict[str, str], Path], _MetaRow],
+) -> Iterator[tuple[Path, _MetaRow]]:
+    """
+    Run one batched exiftool call over *paths* and yield rows progressively.
+
+    All paths go into a single exiftool invocation (one Perl cold-start ~200
+    ms), but each file's row is yielded as soon as its output block completes
+    rather than after the whole batch finishes — so the user sees results
+    trickle in while exiftool is still working.
+
+    exiftool processes its argument list in order, so rows come out in input
+    order. Any input exiftool produced no record for (unreadable file) yields a
+    placeholder row built from an empty record, in its original position, so
+    every requested file gets a line.
 
     Args:
-        text: stdout from a one-file exiftool invocation.
+        paths: files to analyze. May be empty; nothing is spawned then. args:
+        exiftool flags and tag selectors (everything between the
+            binary name and the paths).
+        build_row: converts one parsed record (possibly empty) into a
+            ``_MetaRow`` for the given path.
 
-    Returns:
-        Flat dict of ``{tag: value}``. Empty if no key:value lines were
-        present.
+    Yields:
+        ``(path, row)`` pairs in input order.
     """
-    rec: dict[str, str] = {}
-    for line in text.splitlines():
-        if ":" in line:
-            k, _, v = line.partition(":")
-            rec[k.strip()] = v.strip()
-    return rec
+    if not paths:
+        return
+
+    pos = {os.path.normpath(str(p)): i for i, p in enumerate(paths)}
+    idx = 0  # next input index to yield
+    headerless: dict[str, str] | None = None
+    for rec in _stream_exiftool_records(["exiftool", *args, *map(str, paths)]):
+        f = rec.get("_file")
+        if f is None:
+            # Single-file invocation: no header to match on. Hold the record and
+            # align it positionally after the stream ends.
+            headerless = rec
+            continue
+        i = pos.get(os.path.normpath(f))
+        if i is None or i < idx:
+            continue
+        # Inputs before this one produced no record — emit placeholders.
+        while idx < i:
+            yield paths[idx], build_row({}, paths[idx])
+            idx += 1
+        yield paths[i], build_row(rec, paths[i])
+        idx += 1
+
+    if headerless is not None and len(paths) == 1 and idx == 0:
+        yield paths[0], build_row(headerless, paths[0])
+        idx = 1
+    while idx < len(paths):
+        yield paths[idx], build_row({}, paths[idx])
+        idx += 1
 
 
-def batch_r3d(paths: list[Path]) -> dict[Path, _MetaRow]:
-    """Process all R3D files in a single exiftool call.
+#: exiftool flags + tags for R3D files, in ``stream_r3d``'s single call.
+_R3D_ARGS = [
+    "-s2",
+    "-m",
+    "-FrameRate",
+    "-DateTimeOriginal",
+    "-ImageWidth",
+    "-ImageHeight",
+    "-SerialNumber",
+    "-Filename",
+]
 
-    R3D is RED Camera's proprietary format, not handled by mediainfo.
-    Exiftool reads its tags reliably but, like all Perl-based tools,
-    pays a hefty cold-start cost (~200 ms). Batching every R3D file
-    into one invocation eliminates N-1 of those startups.
+
+def _r3d_row(rec: dict[str, str], p: Path) -> _MetaRow:
+    """Convert one R3D exiftool record into a ``_MetaRow``."""
+    fps = _norm_fps(rec.get("FrameRate", ""))
+    date = _norm_date_iso(rec.get("DateTimeOriginal", ""))
+    w = rec.get("ImageWidth", "")
+    h = rec.get("ImageHeight", "")
+    # exiftool emits "FileName" (capital N); some older versions used
+    # "Filename" (lowercase). Accept either.
+    name = rec.get("FileName") or rec.get("Filename") or p.name
+
+    sn = rec.get("SerialNumber", "")
+    res = f"{w} x {h}" if (w and h) else ""
+    return (fps, res, date, sn, name)
+
+
+def stream_r3d(paths: list[Path]) -> Iterator[tuple[Path, _MetaRow]]:
+    """
+    Process all R3D files in a single exiftool call, streaming rows.
+
+    R3D is RED Camera's proprietary format, not handled by mediainfo. Exiftool
+    reads its tags reliably but, like all Perl-based tools, pays a hefty
+    cold-start cost (~200 ms). Batching every R3D file into one invocation
+    eliminates N-1 of those startups, and rows are yielded progressively as
+    exiftool finishes each file.
 
     The fields we extract:
 
@@ -537,61 +601,11 @@ def batch_r3d(paths: list[Path]) -> dict[Path, _MetaRow]:
     Args:
         paths: R3D files to analyze. May be empty.
 
-    Returns:
-        A dict mapping each input path to a ``_MetaRow`` 5-tuple
-        ``(fps, res, date, sn, name)`` for rendering and consistency
-        checking.
+    Yields:
+        ``(path, row)`` pairs in input order — a ``_MetaRow`` 5-tuple ``(fps,
+        res, date, sn, name)`` for rendering and consistency checking.
     """
-    if not paths:
-        return {}
-
-    out = run_capture(
-        [
-            "exiftool",
-            "-s2",
-            "-m",
-            "-FrameRate",
-            "-DateTimeOriginal",
-            "-ImageWidth",
-            "-ImageHeight",
-            "-SerialNumber",
-            "-Filename",
-            *map(str, paths),
-        ]
-    )
-    recs = _split_exiftool_batches(out, len(paths))
-
-    # Build a path -> record lookup. With >=2 files, exiftool's "========"
-    # headers give us the path explicitly; with exactly 1 file we trust
-    # positional alignment instead.
-    by_file: dict[str, dict[str, str]] = {}
-    for rec in recs:
-        f = rec.get("_file")
-        if f:
-            by_file[os.path.normpath(f)] = rec
-
-    results: dict[Path, _MetaRow] = {}
-    for p in paths:
-        rec = by_file.get(os.path.normpath(str(p)))
-        if rec is None and len(paths) == 1 and recs:
-            # Single-file fallback: there's only one record and it has no
-            # path header, so it must be for our single input.
-            rec = recs[0]
-        if rec is None:
-            rec = {}
-
-        fps = _norm_fps(rec.get("FrameRate", ""))
-        date = _norm_date_iso(rec.get("DateTimeOriginal", ""))
-        w = rec.get("ImageWidth", "")
-        h = rec.get("ImageHeight", "")
-        # exiftool emits "FileName" (capital N); some older versions used
-        # "Filename" (lowercase). Accept either.
-        name = rec.get("FileName") or rec.get("Filename") or p.name
-
-        sn = rec.get("SerialNumber", "")
-        res = f"{w} x {h}" if (w and h) else ""
-        results[p] = (fps, res, date, sn, name)
-    return results
+    return _stream_exiftool_rows(paths, _R3D_ARGS, _r3d_row)
 
 
 def _first_fps(rec: dict[str, str], keys: tuple[str, ...]) -> str:
@@ -621,83 +635,67 @@ def _first_date(rec: dict[str, str], keys: tuple[str, ...]) -> str:
     return ""
 
 
-def batch_wav(paths: list[Path]) -> dict[Path, _MetaRow]:
-    """Process all WAV files in a single exiftool call.
+#: exiftool flags + tags for BWF WAV files, in ``stream_wav``'s single call.
+_WAV_ARGS = [
+    "-s",
+    "-s",
+    # Frame-rate aliases, in order of preference. The first non-empty
+    # value wins. iXML's BWF tags are the most authoritative for
+    # location-sound recordings.
+    "-BwfxmlSpeedTimecodeRate",
+    "-Speed",
+    "-VideoFrameRate",
+    # Date aliases. We probe all of them and take the first that
+    # contains real (non-zero) digits, since some recorders write
+    # placeholder dates when no system clock is set.
+    "-DateTimeOriginal",
+    "-DateCreated",
+    "-OriginatorReference",
+    "-BwfxmlBextBwfOriginationDate",
+    "-Filename",
+]
 
-    Production audio WAVs (BWF — Broadcast Wave Format) carry timecode
-    and date info in iXML or BEXT chunks. Different recorders write the
-    same logical fields under different tags, so we probe several aliases
-    for both the frame rate (timecode rate) and the date, taking the
-    first one that has a usable value.
+#: Probe order matters: try the most-specific tags first so a recorder
+#: that writes both BWF timecode rate and a generic VideoFrameRate ends
+#: up with the BWF value (which is the intended audio reference).
+_WAV_FPS_KEYS = ("BwfxmlSpeedTimecodeRate", "VideoFrameRate", "Speed")
+_WAV_DATE_KEYS = (
+    "DateTimeOriginal",
+    "DateCreated",
+    "OriginatorReference",
+    "BwfxmlBextBwfOriginationDate",
+)
+
+
+def _wav_row(rec: dict[str, str], p: Path) -> _MetaRow:
+    """Convert one BWF WAV exiftool record into a ``_MetaRow``."""
+    # First non-empty FPS-equivalent tag wins; first date tag with a
+    # real (non-zero) value wins. Probe order is significant (see above).
+    fps = _first_fps(rec, _WAV_FPS_KEYS)
+    date = _first_date(rec, _WAV_DATE_KEYS)
+
+    name = rec.get("FileName") or rec.get("Filename") or p.name
+    return (fps, "Audio", date, "", name)
+
+
+def stream_wav(paths: list[Path]) -> Iterator[tuple[Path, _MetaRow]]:
+    """
+    Process all WAV files in a single exiftool call, streaming rows.
+
+    Production audio WAVs (BWF — Broadcast Wave Format) carry timecode and date
+    info in iXML or BEXT chunks. Different recorders write the same logical
+    fields under different tags, so we probe several aliases for both the frame
+    rate (timecode rate) and the date, taking the first one that has a usable
+    value. Rows are yielded progressively as exiftool finishes each file.
 
     Args:
         paths: WAV files to analyze. May be empty.
 
-    Returns:
-        A dict mapping each input path to a ``_MetaRow`` 5-tuple
-        ``(fps, "Audio", date, "", name)`` for rendering and consistency
-        checking.
+    Yields:
+        ``(path, row)`` pairs in input order — a ``_MetaRow`` 5-tuple ``(fps,
+        "Audio", date, "", name)`` for rendering and consistency checking.
     """
-    if not paths:
-        return {}
-
-    out = run_capture(
-        [
-            "exiftool",
-            "-s",
-            "-s",
-            # Frame-rate aliases, in order of preference. The first non-empty
-            # value wins. iXML's BWF tags are the most authoritative for
-            # location-sound recordings.
-            "-BwfxmlSpeedTimecodeRate",
-            "-Speed",
-            "-VideoFrameRate",
-            # Date aliases. We probe all of them and take the first that
-            # contains real (non-zero) digits, since some recorders write
-            # placeholder dates when no system clock is set.
-            "-DateTimeOriginal",
-            "-DateCreated",
-            "-OriginatorReference",
-            "-BwfxmlBextBwfOriginationDate",
-            "-Filename",
-            *map(str, paths),
-        ]
-    )
-    recs = _split_exiftool_batches(out, len(paths))
-
-    # Probe order matters: try the most-specific tags first so a recorder
-    # that writes both BWF timecode rate and a generic VideoFrameRate ends
-    # up with the BWF value (which is the intended audio reference).
-    fps_keys = ("BwfxmlSpeedTimecodeRate", "VideoFrameRate", "Speed")
-    date_keys = (
-        "DateTimeOriginal",
-        "DateCreated",
-        "OriginatorReference",
-        "BwfxmlBextBwfOriginationDate",
-    )
-
-    by_file: dict[str, dict[str, str]] = {}
-    for rec in recs:
-        f = rec.get("_file")
-        if f:
-            by_file[os.path.normpath(f)] = rec
-
-    results: dict[Path, _MetaRow] = {}
-    for p in paths:
-        rec = by_file.get(os.path.normpath(str(p)))
-        if rec is None and len(paths) == 1 and recs:
-            rec = recs[0]
-        if rec is None:
-            rec = {}
-
-        # First non-empty FPS-equivalent tag wins; first date tag with a
-        # real (non-zero) value wins. Probe order is significant (see above).
-        fps = _first_fps(rec, fps_keys)
-        date = _first_date(rec, date_keys)
-
-        name = rec.get("FileName") or rec.get("Filename") or p.name
-        results[p] = (fps, "Audio", date, "", name)
-    return results
+    return _stream_exiftool_rows(paths, _WAV_ARGS, _wav_row)
 
 
 # ---------------------------------------------------------------------------
@@ -713,7 +711,7 @@ def batch_sn(paths: list[Path]) -> dict[Path, str]:
     default mode to avoid the Perl cold-start penalty for a field the user
     didn't ask for.
 
-    For R3D files the serial number is already fetched inside ``batch_r3d``
+    For R3D files the serial number is already fetched inside ``stream_r3d``
     as part of its normal exiftool call, so ``batch_sn`` is only invoked
     for mediainfo-handled files (MP4, MOV, MXF) and WAV.
 
@@ -993,19 +991,20 @@ def _format_line(t: _MetaRow, fields: list[str], *, sn_extra: str = "", audio: b
 def _render_single_file(target: Path, fields: list[str], *, force: bool) -> int:
     """Print metadata line(s) for a single file argument; return exit code."""
     ext = target.suffix.lower().lstrip(".")
+    rows: Iterable[_MetaRow]
     if ext in CAMERA_VIDEO_EXTS or (ext in OTHER_VIDEO_EXTS and force):
-        results = batch_mediainfo([target])
+        rows = batch_mediainfo([target]).values()
     elif ext == "r3d":
-        results = batch_r3d([target])
+        rows = (t for _p, t in stream_r3d([target]))
     elif ext == "wav":
-        results = batch_wav([target])
+        rows = (t for _p, t in stream_wav([target]))
     elif ext in OTHER_VIDEO_EXTS:
         print(f"Skipped non-camera video container: {target.name} (use -f to analyze it)", file=sys.stderr)
         return 1
     else:
         print(f"Unsupported file type: {target.name}", file=sys.stderr)
         return 1
-    for t in results.values():
+    for t in rows:
         print(_format_line(t, fields, audio=ext == "wav"))
     return 0
 
@@ -1052,46 +1051,39 @@ def _process_batch(
     r3d: list[Path],
     wav: list[Path],
     fields: list[str],
-) -> tuple[list[str], list[tuple[str, str, str, str]]]:
-    """Run the metadata tools for one batch; return (output lines, raw field tuples).
-
-    ``batch_sn`` is only called when ``--sn`` was requested; for R3D the
-    serial number is already inside the ``batch_r3d`` tuple.
+) -> Iterator[tuple[str, tuple[str, str, str, str]]]:
     """
-    mi_out = batch_mediainfo(mi)
-    r3d_out = batch_r3d(r3d)
-    wav_out = batch_wav(wav)
+    Run the metadata tools for one batch, yielding (line, raw fields) pairs.
+
+    mediainfo rows arrive in one blocking call (it buffers its whole JSON
+    document internally); exiftool rows for R3D and WAV stream out progressively
+    as each file completes. ``batch_sn`` is only called when ``--sn`` was
+    requested; for R3D the serial number is already inside the streamed row.
+    """
     sn_mi = batch_sn(mi) if "sn" in fields else {}
     sn_wav = batch_sn(wav) if "sn" in fields else {}
 
-    lines: list[str] = []
-    raw: list[tuple[str, str, str, str]] = []
+    mi_out = batch_mediainfo(mi)
     for p in mi:
-        if p in mi_out:
-            t = mi_out[p]
-            sn = sn_mi.get(p, "")
-            lines.append(_format_line(t, fields, sn_extra=sn))
-            raw.append((t[0], t[1], t[2], sn))
-    for p in r3d:
-        if p in r3d_out:
-            t = r3d_out[p]
-            lines.append(_format_line(t, fields))
-            raw.append((t[0], t[1], t[2], t[3]))
-    for p in wav:
-        if p in wav_out:
-            t = wav_out[p]
-            sn = sn_wav.get(p, "")
-            lines.append(_format_line(t, fields, sn_extra=sn, audio=True))
-            raw.append((t[0], t[1], t[2], sn))
-    return lines, raw
+        t = mi_out[p]
+        sn = sn_mi.get(p, "")
+        yield _format_line(t, fields, sn_extra=sn), (t[0], t[1], t[2], sn)
+    for _p, t in stream_r3d(r3d):
+        yield _format_line(t, fields), (t[0], t[1], t[2], t[3])
+    for p, t in stream_wav(wav):
+        sn = sn_wav.get(p, "")
+        yield _format_line(t, fields, sn_extra=sn, audio=True), (t[0], t[1], t[2], sn)
 
 
 def _emit_directory(target: Path, fields: list[str], *, force: bool) -> list[tuple[str, str, str, str]]:
-    """Walk a directory, print the header + one line per file, return raw field tuples.
+    """
+    Walk a directory, print the header + one line per file, return raw field
+    tuples.
 
     Files are batched by ``_batch_groups``, which merges lone-clip subdirs so
-    cameras nesting one clip per folder don't pay a cold-start per clip.
-    Results print progressively as each batch completes.
+    cameras nesting one clip per folder don't pay a cold-start per clip. Lines
+    print progressively — exiftool-handled files (R3D, WAV) stream out one by
+    one within each batch; mediainfo-handled files land per batch.
     """
     active_labels = [(f, _FIELD_LABELS[f]) for f in fields if f in _FIELD_LABELS]
 
@@ -1105,10 +1097,9 @@ def _emit_directory(target: Path, fields: list[str], *, force: bool) -> list[tup
         print(_build_header(active_labels))
 
     for mi, r3d, wav in batches:
-        lines, raw = _process_batch(mi, r3d, wav, fields)
-        all_raw.extend(raw)
-        for line in lines:
+        for line, raw in _process_batch(mi, r3d, wav, fields):
             print(line)
+            all_raw.append(raw)
     return all_raw
 
 
