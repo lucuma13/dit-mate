@@ -53,7 +53,7 @@ classifiers = [
 ]
 dependencies = [
   "humanize>=4.16",
-  "packaging>=25",
+  "packaging>=26.2",
   "platformdirs>=4.10",
   "pyperclip>=1.11",
   "xxhash>=3.8.1",
