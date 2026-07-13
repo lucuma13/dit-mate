@@ -82,4 +82,7 @@ Run any tool with `--help` to see the full list of options.
 
 ### ⚠️ Disclaimer
 
-The `lifsaver` utility  deliberately circumvents standard macOS Disk Arbitration and LIFS (Live Image File System) protections to force-mount stalled volumes. The author assumes no liability for lost or corrupted data, or hardware failures of any kind.
+`lifsaver`  deliberately circumvents standard macOS Disk Arbitration and LIFS
+(Live Image File System) protections to force-mount stalled volumes. The author
+assumes no liability for lost or corrupted data, or hardware failures of any
+kind.
