@@ -5,14 +5,7 @@
 """
 `dit-mate` lists the tools in the suite with a brief description of each.
 
-Every tool is its own command; this entry point is a signpost, not a
-dispatcher. Run a tool with `--help` to see its own options.
-
-Example:
-
-```bash
-dit-mate
-```
+Every tool is its own command; this entry point is a signpost, not a dispatcher.
 """
 # Copyright (c) 2026 Luis Gómez Gutiérrez. License: MIT.
 
@@ -26,10 +19,7 @@ from dit_mate.update_checker import run_with_update_check
 # Version
 # -----------------------------------------------------------------------------
 
-try:
-    __version__ = importlib.metadata.version("dit-mate")
-except importlib.metadata.PackageNotFoundError:  # pragma: no cover
-    __version__ = "unknown"
+__version__ = importlib.metadata.version("dit-mate")
 
 # -----------------------------------------------------------------------------
 # The suite
@@ -65,8 +55,6 @@ def format_help(*, color: bool) -> str:
 
 
 def _main() -> None:
-    # No arguments to parse beyond two flags, and nothing to dispatch to — argparse
-    # would only add back the usage/options boilerplate we don't want on this screen.
     args = sys.argv[1:]
 
     if args == ["--version"]:
@@ -75,8 +63,7 @@ def _main() -> None:
 
     print(format_help(color=supports_color(sys.stdout)))
 
-    # An unknown argument gets the same help screen — there is nothing more useful to
-    # say — but exits non-zero so scripts and shells still see it as a failure.
+    # An unknown argument gets the same help screen.
     if args and not HELP_FLAGS.issuperset(args):
         sys.exit(1)
 
